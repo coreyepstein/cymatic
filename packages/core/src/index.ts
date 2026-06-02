@@ -19,3 +19,9 @@ export * from "./audio/index.js";
 // Timing / clock abstraction (US-003): a single Clock interface backing both a
 // realtime (rAF, wall-clock) and an offline (fixed 1/fps, deterministic) driver.
 export * from "./clock/index.js";
+
+// Renderer abstraction (US-004): a backend-agnostic Renderer surface with a
+// createRenderer() factory that selects WebGPU (preferred) or WebGL (fallback)
+// via capability detection. Presets target the Renderer and never branch on the
+// backend.
+export * from "./render/index.js";
