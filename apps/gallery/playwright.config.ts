@@ -21,7 +21,22 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      use: { ...devices["Desktop Chrome"] },
+      use: {
+        ...devices["Desktop Chrome"],
+        // Maximize the chance of a working GPU/WebGPU in headless Chromium so
+        // the render-smoke test can exercise the real WebGPU path when the
+        // sandbox allows it. The tests do NOT depend on WebGPU — they fall back
+        // to WebGL transparently — these flags only widen coverage.
+        launchOptions: {
+          args: [
+            "--enable-unsafe-webgpu",
+            "--enable-features=Vulkan",
+            "--use-gl=angle",
+            "--use-angle=swiftshader",
+            "--ignore-gpu-blocklist",
+          ],
+        },
+      },
     },
   ],
   webServer: {

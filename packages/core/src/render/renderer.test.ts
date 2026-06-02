@@ -218,49 +218,102 @@ describe("preset-facing call path is backend-agnostic", () => {
   });
 
   it("drives a webgpu backend through the SAME smoke scene path", async () => {
-    const submit = vi.fn();
-    const end = vi.fn();
-    const passDescriptors: unknown[] = [];
-    const device = {
-      createCommandEncoder: () => ({
-        beginRenderPass: (d: unknown) => {
-          passDescriptors.push(d);
-          return { end };
-        },
-        finish: () => ({}),
-      }),
-      queue: { submit },
-    };
-    const gpuCtx = {
-      configure: vi.fn(),
-      getCurrentTexture: () => ({ createView: () => ({}) }),
-    };
-    const canvas: RenderCanvasLike = {
-      width: 0,
-      height: 0,
-      getContext(id: string): unknown {
-        return id === "webgpu" ? gpuCtx : null;
-      },
-    };
-    const gpu = {
-      requestAdapter: () => Promise.resolve({ requestDevice: () => Promise.resolve(device) }),
-      getPreferredCanvasFormat: () => "bgra8unorm",
-    };
-
-    const renderer = createRenderer(canvas, { backend: "webgpu", gpu });
+    const harness = makeWebgpuHarness();
+    const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
     // EXACT same preset path as the webgl case.
     await runSmokePreset(renderer);
 
-    expect(canvas.width).toBe(1280);
-    expect(canvas.height).toBe(960);
-    expect(submit).toHaveBeenCalledTimes(1);
-    expect(end).toHaveBeenCalledTimes(1);
-    const desc = passDescriptors[0] as {
-      colorAttachments: Array<{ clearValue: { r: number; g: number; b: number; a: number } }>;
+    expect(harness.canvas.width).toBe(1280);
+    expect(harness.canvas.height).toBe(960);
+    // The smoke scene draws no rects: exactly one pass, cleared to the
+    // background, and one submit.
+    expect(harness.submit).toHaveBeenCalledTimes(1);
+    expect(harness.passDescriptors).toHaveLength(1);
+    const desc = harness.passDescriptors[0] as {
+      colorAttachments: Array<{
+        clearValue: { r: number; g: number; b: number; a: number };
+        loadOp: string;
+      }>;
     };
+    expect(desc.colorAttachments[0]?.loadOp).toBe("clear");
     expect(desc.colorAttachments[0]?.clearValue).toEqual({ r: 0.1, g: 0.2, b: 0.3, a: 1 });
+    // The pipeline is built once in init() and bound for the frame.
+    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(1);
+    expect(harness.setPipeline).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * A recording WebGPU harness modelling the structural slice the renderer uses:
+ * a device exposing `createShaderModule` / `createRenderPipeline` /
+ * `createBuffer` / `queue.writeBuffer`, and a render pass recording
+ * `setPipeline` / `setVertexBuffer` / `draw`. Returns the spies the contract
+ * assertions read.
+ */
+function makeWebgpuHarness() {
+  const submit = vi.fn();
+  const writeBuffer = vi.fn();
+  const setPipeline = vi.fn();
+  const setVertexBuffer = vi.fn();
+  const end = vi.fn();
+  /** Records `[vertexCount, instanceCount]` per `draw` call. */
+  const drawCalls: Array<[number, number | undefined]> = [];
+  const passDescriptors: unknown[] = [];
+  const createRenderPipeline = vi.fn((_d: unknown) => ({ __brand: "pipeline" as const }));
+  const createShaderModule = vi.fn((_d: unknown) => ({ __brand: "shader" as const }));
+  const createBuffer = vi.fn((_d: unknown) => ({ destroy: vi.fn() }));
+
+  const device = {
+    createShaderModule,
+    createRenderPipeline,
+    createBuffer,
+    createCommandEncoder: () => ({
+      beginRenderPass: (d: unknown) => {
+        passDescriptors.push(d);
+        return {
+          setPipeline,
+          setVertexBuffer,
+          draw: (vertexCount: number, instanceCount?: number) => {
+            drawCalls.push([vertexCount, instanceCount]);
+          },
+          end,
+        };
+      },
+      finish: () => ({}),
+    }),
+    queue: { submit, writeBuffer },
+  };
+  const gpuCtx = {
+    configure: vi.fn(),
+    getCurrentTexture: () => ({ createView: () => ({}) }),
+  };
+  const canvas: RenderCanvasLike = {
+    width: 0,
+    height: 0,
+    getContext(id: string): unknown {
+      return id === "webgpu" ? gpuCtx : null;
+    },
+  };
+  const gpu = {
+    requestAdapter: () => Promise.resolve({ requestDevice: () => Promise.resolve(device) }),
+    getPreferredCanvasFormat: () => "bgra8unorm",
+  };
+
+  return {
+    canvas,
+    gpu,
+    submit,
+    writeBuffer,
+    setPipeline,
+    setVertexBuffer,
+    end,
+    drawCalls,
+    passDescriptors,
+    createRenderPipeline,
+    createShaderModule,
+    createBuffer,
+  };
+}
 
 describe("drawRect primitive (backend-agnostic)", () => {
   it("webgl draws a rect via a scissored clear in device pixels", async () => {
@@ -298,52 +351,74 @@ describe("drawRect primitive (backend-agnostic)", () => {
     expect(gl.scissor).not.toHaveBeenCalled();
   });
 
-  it("webgpu draws a rect via a scissored load-pass", async () => {
-    const submit = vi.fn();
-    const scissorCalls: number[][] = [];
-    const passDescriptors: unknown[] = [];
-    const device = {
-      createCommandEncoder: () => ({
-        beginRenderPass: (d: unknown) => {
-          passDescriptors.push(d);
-          return {
-            setScissorRect: (x: number, y: number, w: number, h: number) =>
-              scissorCalls.push([x, y, w, h]),
-            end: vi.fn(),
-          };
-        },
-        finish: () => ({}),
-      }),
-      queue: { submit },
-    };
-    const gpuCtx = {
-      configure: vi.fn(),
-      getCurrentTexture: () => ({ createView: () => ({}) }),
-    };
-    const canvas: RenderCanvasLike = {
-      width: 0,
-      height: 0,
-      getContext: (id: string) => (id === "webgpu" ? gpuCtx : null),
-    };
-    const gpu = {
-      requestAdapter: () => Promise.resolve({ requestDevice: () => Promise.resolve(device) }),
-      getPreferredCanvasFormat: () => "bgra8unorm",
-    };
-    const renderer = createRenderer(canvas, { backend: "webgpu", gpu });
+  it("webgpu draws rects via ONE instanced draw, not per-rect clears", async () => {
+    // The regression contract: after beginFrame + N drawRect + endFrame the
+    // renderer must open EXACTLY ONE render pass for the frame (cleared to the
+    // background), bind the pipeline, and issue a SINGLE instanced draw(6, N).
+    // The old implementation opened a render pass per rect, each with
+    // loadOp:"clear" set to that rect's color — which clears the whole canvas
+    // and leaves only the last fill (the blank-canvas bug). That implementation
+    // records N+1 passes and zero `draw` calls, so it fails every assertion
+    // below; the instanced pipeline passes them.
+    const harness = makeWebgpuHarness();
+    const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
     await renderer.init();
     renderer.resize(100, 100, 2); // 200x200
 
     renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
     renderer.drawRect({ x: 0.25, y: 0.25, w: 0.5, h: 0.5, color: { r: 1, g: 0, b: 0, a: 1 } });
+    renderer.drawRect({ x: 0, y: 0, w: 0.25, h: 0.25, color: { r: 0, g: 1, b: 0, a: 1 } });
+    renderer.drawRect({ x: 0.5, y: 0.5, w: 0.5, h: 0.5, color: { r: 0, g: 0, b: 1, a: 1 } });
     renderer.endFrame();
 
-    // device px: x=50, y=50, w=100, h=100
-    expect(scissorCalls).toEqual([[50, 50, 100, 100]]);
-    // The rect pass clears just its region to the fill color.
-    const rectPass = passDescriptors[1] as {
+    // Exactly ONE pass for the whole frame (not one per rect).
+    expect(harness.passDescriptors).toHaveLength(1);
+    const pass = harness.passDescriptors[0] as {
       colorAttachments: Array<{ clearValue: RgbaColor; loadOp: string }>;
     };
-    expect(rectPass.colorAttachments[0]?.clearValue).toEqual({ r: 1, g: 0, b: 0, a: 1 });
-    expect(submit).toHaveBeenCalledTimes(1);
+    // That single pass clears to the BACKGROUND (not a rect color).
+    expect(pass.colorAttachments[0]?.loadOp).toBe("clear");
+    expect(pass.colorAttachments[0]?.clearValue).toEqual({ r: 0, g: 0, b: 0, a: 1 });
+    // Pipeline bound, instance buffer set, and a SINGLE instanced draw of all 3.
+    expect(harness.setPipeline).toHaveBeenCalledTimes(1);
+    expect(harness.setVertexBuffer).toHaveBeenCalledTimes(1);
+    expect(harness.drawCalls).toEqual([[6, 3]]);
+    // Instance data was uploaded once for this frame.
+    expect(harness.writeBuffer).toHaveBeenCalledTimes(1);
+    expect(harness.submit).toHaveBeenCalledTimes(1);
+  });
+
+  it("webgpu skips zero-area rects (no instance for them)", async () => {
+    const harness = makeWebgpuHarness();
+    const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
+    await renderer.init();
+    renderer.resize(100, 100, 1);
+
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.drawRect({ x: 0, y: 0, w: 0, h: 0.5, color: { r: 1, g: 1, b: 1, a: 1 } });
+    renderer.drawRect({ x: 0, y: 0, w: 0.5, h: 0.5, color: { r: 1, g: 0, b: 0, a: 1 } });
+    renderer.endFrame();
+
+    // Only the one non-degenerate rect becomes an instance.
+    expect(harness.drawCalls).toEqual([[6, 1]]);
+  });
+
+  it("webgpu builds the quad pipeline exactly once across frames", async () => {
+    const harness = makeWebgpuHarness();
+    const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
+    await renderer.init();
+    renderer.resize(100, 100, 1);
+
+    for (let frame = 0; frame < 3; frame++) {
+      renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+      renderer.drawRect({ x: 0, y: 0, w: 0.5, h: 0.5, color: { r: 1, g: 0, b: 0, a: 1 } });
+      renderer.endFrame();
+    }
+
+    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(1);
+    expect(harness.createShaderModule).toHaveBeenCalledTimes(1);
+    // One pass + one instanced draw per frame.
+    expect(harness.passDescriptors).toHaveLength(3);
+    expect(harness.drawCalls).toEqual([[6, 1], [6, 1], [6, 1]]);
   });
 });
