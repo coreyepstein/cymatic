@@ -18,7 +18,11 @@ import {
   clamp01,
   computeBands,
   computeRms,
+  crestFactor,
   ema,
+  estimateTempo,
+  spectralCentroid,
+  spectralRolloff,
   type AudioFeatureFrame,
   type BandSplit,
 } from "./features.js";
@@ -38,6 +42,26 @@ export interface AnalyserOptions {
   bandSplit?: BandSplit;
   /** Onset-detector tuning. */
   beat?: BeatDetectorOptions;
+  /**
+   * EMA smoothing for the *short* (fast) loudness envelope in [0, 1). Lower =
+   * snappier. Default `0.5`.
+   */
+  loudnessShortSmoothing?: number;
+  /**
+   * EMA smoothing for the *long* (slow) loudness envelope in [0, 1). Higher =
+   * more sustained / laggier. Default `0.95`.
+   */
+  loudnessLongSmoothing?: number;
+  /**
+   * Rolling window (in seconds) over which onsets are retained for tempo and
+   * onset-density estimation. Default `4`.
+   */
+  tempoWindowSeconds?: number;
+  /**
+   * EMA smoothing applied to the estimated tempo in [0, 1) so the BPM locks and
+   * does not jitter every frame. Higher = stickier. Default `0.9`.
+   */
+  tempoSmoothing?: number;
 }
 
 interface ResolvedOptions {
@@ -45,6 +69,10 @@ interface ResolvedOptions {
   bandCount: number;
   smoothing: number;
   bandSplit: BandSplit;
+  loudnessShortSmoothing: number;
+  loudnessLongSmoothing: number;
+  tempoWindowSeconds: number;
+  tempoSmoothing: number;
 }
 
 const DEFAULTS: ResolvedOptions = {
@@ -52,6 +80,10 @@ const DEFAULTS: ResolvedOptions = {
   bandCount: 32,
   smoothing: 0.6,
   bandSplit: DEFAULT_BAND_SPLIT,
+  loudnessShortSmoothing: 0.5,
+  loudnessLongSmoothing: 0.95,
+  tempoWindowSeconds: 4,
+  tempoSmoothing: 0.9,
 };
 
 /**
@@ -69,6 +101,16 @@ export class AudioAnalyser {
   // Smoothed running state.
   private smoothedBands: number[];
   private smoothedRms = 0;
+  private loudnessShort = 0;
+  private loudnessLong = 0;
+  /** Locked/smoothed tempo estimate in BPM (0 until enough history). */
+  private lockedTempo = 0;
+  /** Beat phase in [0, 1) advanced by time, re-aligned on onsets. */
+  private beatPhase = 0;
+  /** Time of the previous processed frame, for phase advance. null = first. */
+  private prevTime: number | null = null;
+  /** Rolling onset timestamps (seconds) within the tempo window. */
+  private onsetTimes: number[] = [];
 
   constructor(options: AnalyserOptions = {}) {
     this.opts = {
@@ -76,6 +118,17 @@ export class AudioAnalyser {
       bandCount: options.bandCount ?? DEFAULTS.bandCount,
       smoothing: clamp01(options.smoothing ?? DEFAULTS.smoothing),
       bandSplit: options.bandSplit ?? DEFAULTS.bandSplit,
+      loudnessShortSmoothing: clamp01(
+        options.loudnessShortSmoothing ?? DEFAULTS.loudnessShortSmoothing,
+      ),
+      loudnessLongSmoothing: clamp01(
+        options.loudnessLongSmoothing ?? DEFAULTS.loudnessLongSmoothing,
+      ),
+      tempoWindowSeconds:
+        options.tempoWindowSeconds ?? DEFAULTS.tempoWindowSeconds,
+      tempoSmoothing: clamp01(
+        options.tempoSmoothing ?? DEFAULTS.tempoSmoothing,
+      ),
     };
     this.beatDetector = new BeatDetector(options.beat);
     this.smoothedBands = new Array<number>(this.opts.bandCount).fill(0);
@@ -95,6 +148,12 @@ export class AudioAnalyser {
   reset(): void {
     this.smoothedBands = new Array<number>(this.opts.bandCount).fill(0);
     this.smoothedRms = 0;
+    this.loudnessShort = 0;
+    this.loudnessLong = 0;
+    this.lockedTempo = 0;
+    this.beatPhase = 0;
+    this.prevTime = null;
+    this.onsetTimes = [];
     this.beatDetector.reset();
   }
 
@@ -158,10 +217,66 @@ export class AudioAnalyser {
     const rawRms = computeRms(timeData);
     this.smoothedRms = ema(this.smoothedRms, rawRms, s);
 
+    // Loudness envelope: a fast and a slow EMA of the raw RMS. Their ratio
+    // gives a crest/dynamics measure (punchy vs sustained).
+    this.loudnessShort = ema(
+      this.loudnessShort,
+      rawRms,
+      this.opts.loudnessShortSmoothing,
+    );
+    this.loudnessLong = ema(
+      this.loudnessLong,
+      rawRms,
+      this.opts.loudnessLongSmoothing,
+    );
+    const dynamics = crestFactor(this.loudnessShort, this.loudnessLong);
+
     const groups = bandGroups(this.smoothedBands, this.opts.bandSplit);
+
+    // Spectral shape on the raw (un-smoothed) spectrum so brightness tracks
+    // transients sharply.
+    const centroid = spectralCentroid(freqData);
+    const rolloff = spectralRolloff(freqData);
+
     // Onset detection runs on the raw frequency spectrum (un-smoothed) so
-    // transients stay sharp.
+    // transients stay sharp. Its rectified flux is exposed in the frame.
     const onset = this.beatDetector.process(freqData);
+    const flux = this.beatDetector.lastFlux;
+
+    // Maintain a rolling window of onset timestamps for tempo + density.
+    if (onset) this.onsetTimes.push(time);
+    const windowStart = time - this.opts.tempoWindowSeconds;
+    while (this.onsetTimes.length > 0 && (this.onsetTimes[0] ?? 0) < windowStart) {
+      this.onsetTimes.shift();
+    }
+
+    // Onset density: onsets per second over the elapsed window span.
+    const span = Math.min(this.opts.tempoWindowSeconds, Math.max(0, time));
+    const onsetDensity = span > 0 ? this.onsetTimes.length / span : 0;
+
+    // Tempo: estimate from the onset history and lock it with an EMA so it does
+    // not jitter frame-to-frame. Only update the lock once an estimate exists.
+    const rawTempo = estimateTempo(this.onsetTimes);
+    if (rawTempo > 0) {
+      this.lockedTempo =
+        this.lockedTempo > 0
+          ? ema(this.lockedTempo, rawTempo, this.opts.tempoSmoothing)
+          : rawTempo;
+    }
+
+    // Beat phase: advance by elapsed time at the locked tempo, wrapping in
+    // [0, 1). Re-align to 0 on a detected onset so it stays beat-locked.
+    if (onset) {
+      this.beatPhase = 0;
+    } else if (this.lockedTempo > 0 && this.prevTime !== null) {
+      const dt = time - this.prevTime;
+      if (dt > 0) {
+        const beatsPerSecond = this.lockedTempo / 60;
+        this.beatPhase = (this.beatPhase + dt * beatsPerSecond) % 1;
+        if (this.beatPhase < 0) this.beatPhase += 1;
+      }
+    }
+    this.prevTime = time;
 
     return {
       bands: this.smoothedBands.slice(),
@@ -170,6 +285,15 @@ export class AudioAnalyser {
       treble: groups.treble,
       rms: this.smoothedRms,
       onset,
+      spectralCentroid: centroid,
+      spectralRolloff: rolloff,
+      spectralFlux: flux,
+      loudnessShort: this.loudnessShort,
+      loudnessLong: this.loudnessLong,
+      dynamics,
+      tempo: this.lockedTempo,
+      beatPhase: this.beatPhase,
+      onsetDensity,
       time,
     };
   }

@@ -5,8 +5,12 @@ import {
   clamp01,
   computeBands,
   computeRms,
+  crestFactor,
   ema,
+  estimateTempo,
   logBandEdges,
+  spectralCentroid,
+  spectralRolloff,
 } from "./features.js";
 
 /**
@@ -153,6 +157,94 @@ describe("clamp01", () => {
     expect(clamp01(2)).toBe(1);
     expect(clamp01(0.4)).toBe(0.4);
     expect(clamp01(Number.NaN)).toBe(0);
+  });
+});
+
+describe("spectralCentroid", () => {
+  it("is higher when energy is concentrated in HIGH bins than LOW", () => {
+    const binCount = 512;
+    const low = spectralCentroid(spectrumWithPeak(binCount, 8, 255, 0));
+    const high = spectralCentroid(spectrumWithPeak(binCount, 500, 255, 0));
+    expect(high).toBeGreaterThan(low);
+    // Both normalized into [0, 1].
+    expect(low).toBeGreaterThanOrEqual(0);
+    expect(high).toBeLessThanOrEqual(1);
+  });
+
+  it("is 0 for a silent or trivially-sized spectrum", () => {
+    expect(spectralCentroid(new Uint8Array(256))).toBe(0);
+    expect(spectralCentroid(new Uint8Array(1))).toBe(0);
+    expect(spectralCentroid(new Uint8Array(0))).toBe(0);
+  });
+
+  it("approaches the midpoint for a flat spectrum", () => {
+    const flat = new Uint8Array(256).fill(100);
+    // Mean bin index of a flat spectrum is (n-1)/2 -> 0.5 after normalize.
+    expect(spectralCentroid(flat)).toBeCloseTo(0.5, 2);
+  });
+});
+
+describe("spectralRolloff", () => {
+  it("is higher when energy is spread toward HIGH bins", () => {
+    const binCount = 512;
+    const low = spectralRolloff(spectrumWithPeak(binCount, 8, 255, 0));
+    const high = spectralRolloff(spectrumWithPeak(binCount, 500, 255, 0));
+    expect(high).toBeGreaterThan(low);
+  });
+
+  it("returns a normalized [0, 1] position and 0 for silence", () => {
+    const r = spectralRolloff(spectrumWithPeak(256, 200, 255, 1));
+    expect(r).toBeGreaterThanOrEqual(0);
+    expect(r).toBeLessThanOrEqual(1);
+    expect(spectralRolloff(new Uint8Array(256))).toBe(0);
+  });
+});
+
+describe("crestFactor", () => {
+  it("a punchy (peaky) moment yields higher crest than a sustained flat one", () => {
+    // Punchy: short envelope well above the long (sustained) level.
+    const punchy = crestFactor(0.9, 0.3);
+    // Sustained: short and long are equal -> no crest.
+    const sustained = crestFactor(0.5, 0.5);
+    expect(punchy).toBeGreaterThan(sustained);
+    expect(sustained).toBe(0);
+  });
+
+  it("is bounded to [0, 1] and 0 on silence", () => {
+    expect(crestFactor(0, 0)).toBe(0);
+    expect(crestFactor(1, 0)).toBe(1);
+    expect(crestFactor(0.8, 0.2)).toBeGreaterThan(0);
+    expect(crestFactor(0.8, 0.2)).toBeLessThanOrEqual(1);
+  });
+});
+
+describe("estimateTempo", () => {
+  it("recovers ~120 BPM from onsets every 0.5s", () => {
+    const onsets = [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0];
+    expect(estimateTempo(onsets)).toBeCloseTo(120, 0);
+  });
+
+  it("recovers ~100 BPM from onsets every 0.6s", () => {
+    const onsets = [0, 0.6, 1.2, 1.8, 2.4, 3.0];
+    expect(estimateTempo(onsets)).toBeCloseTo(100, 0);
+  });
+
+  it("octave-folds out-of-range intervals into [60, 200]", () => {
+    // 0.25s gap -> 240 BPM raw -> folds to 120.
+    expect(estimateTempo([0, 0.25, 0.5, 0.75, 1.0])).toBeCloseTo(120, 0);
+    // 1.5s gap -> 40 BPM raw -> folds up to 80.
+    expect(estimateTempo([0, 1.5, 3.0, 4.5])).toBeCloseTo(80, 0);
+  });
+
+  it("returns 0 with fewer than two onsets", () => {
+    expect(estimateTempo([])).toBe(0);
+    expect(estimateTempo([1.0])).toBe(0);
+  });
+
+  it("is robust to a single jittered interval (median, not mean)", () => {
+    // Mostly 0.5s gaps with one outlier; median stays at 120 BPM.
+    const onsets = [0, 0.5, 1.0, 3.0, 3.5, 4.0, 4.5];
+    expect(estimateTempo(onsets)).toBeCloseTo(120, 0);
   });
 });
 

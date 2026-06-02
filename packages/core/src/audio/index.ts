@@ -12,8 +12,12 @@ export {
   clamp01,
   computeBands,
   computeRms,
+  crestFactor,
   ema,
+  estimateTempo,
   logBandEdges,
+  spectralCentroid,
+  spectralRolloff,
 } from "./features.js";
 
 export type { BeatDetectorOptions } from "./beat-detector.js";

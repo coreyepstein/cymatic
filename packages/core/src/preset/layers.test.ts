@@ -39,7 +39,24 @@ class MockRenderer implements Renderer {
 }
 
 function frame(): AudioFeatureFrame {
-  return { bands: [], bass: 0, mid: 0, treble: 0, rms: 0, onset: false, time: 0 };
+  return {
+    bands: [],
+    bass: 0,
+    mid: 0,
+    treble: 0,
+    rms: 0,
+    onset: false,
+    spectralCentroid: 0,
+    spectralRolloff: 0,
+    spectralFlux: 0,
+    loudnessShort: 0,
+    loudnessLong: 0,
+    dynamics: 0,
+    tempo: 0,
+    beatPhase: 0,
+    onsetDensity: 0,
+    time: 0,
+  };
 }
 
 describe("LayerStack", () => {

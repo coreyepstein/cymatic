@@ -20,6 +20,55 @@ export interface AudioFeatureFrame {
   rms: number;
   /** True when a beat/onset was detected on this frame. */
   onset: boolean;
+  /**
+   * Spectral centroid — the energy-weighted "center of mass" of the magnitude
+   * spectrum, normalized to [0, 1] over the bin range. Higher = brighter
+   * (more high-frequency energy). 0 for a silent spectrum.
+   */
+  spectralCentroid: number;
+  /**
+   * Spectral rolloff — the normalized bin position [0, 1] below which a fixed
+   * fraction (default 85%) of the total spectral energy lies. Higher = more
+   * energy spread toward the highs. 0 for a silent spectrum.
+   */
+  spectralRolloff: number;
+  /**
+   * Rectified spectral flux for this frame: the per-bin positive energy
+   * increase versus the previous frame, normalized by bin count. Reuses the
+   * same computation that drives onset detection. >= 0; 0 on the first frame.
+   */
+  spectralFlux: number;
+  /**
+   * Fast EMA of RMS loudness in [0, 1] — tracks the short-term (punchy)
+   * loudness envelope.
+   */
+  loudnessShort: number;
+  /**
+   * Slow EMA of RMS loudness in [0, 1] — tracks the long-term (sustained)
+   * loudness envelope.
+   */
+  loudnessLong: number;
+  /**
+   * Dynamics / crest measure in [0, 1]: how punchy vs sustained the moment is,
+   * derived from the short-vs-long loudness ratio (peak-to-average). ~0 when
+   * the signal is steady; rises toward 1 on sharp transients above the
+   * sustained level.
+   */
+  dynamics: number;
+  /**
+   * Estimated tempo in beats per minute, clamped to [60, 200]. Smoothed/locked
+   * across frames so it does not jitter every frame. 0 until enough onset
+   * history exists to estimate.
+   */
+  tempo: number;
+  /**
+   * Position within the current beat in [0, 1): advances with time at the
+   * estimated tempo and re-aligns to 0 on detected onsets. 0 when no tempo is
+   * yet estimated.
+   */
+  beatPhase: number;
+  /** Detected onsets per second, averaged over a rolling window. >= 0. */
+  onsetDensity: number;
   /** Timestamp for the frame, in seconds. */
   time: number;
 }
@@ -174,4 +223,117 @@ function meanSlice(arr: number[], start: number, end: number): number {
     count++;
   }
   return count > 0 ? sum / count : 0;
+}
+
+/**
+ * Spectral centroid — the energy-weighted mean bin position of a magnitude
+ * spectrum, normalized to [0, 1] across the available bins.
+ *
+ * 0 maps to the lowest bin, 1 to the highest. A spectrum with energy
+ * concentrated in high bins yields a value near 1 (bright); energy in low bins
+ * yields a value near 0 (dark). Returns 0 for an empty or silent spectrum.
+ *
+ * Normalized in bin-index space so it needs no sample rate and stays a pure,
+ * deterministic function of the spectrum alone.
+ */
+export function spectralCentroid(
+  magnitudes: Float32Array | Uint8Array,
+): number {
+  const n = magnitudes.length;
+  if (n <= 1) return 0;
+  let weighted = 0;
+  let total = 0;
+  for (let i = 0; i < n; i++) {
+    const m = magnitudes[i] ?? 0;
+    weighted += i * m;
+    total += m;
+  }
+  if (total <= 0) return 0;
+  // Mean bin index in [0, n-1] -> normalize to [0, 1].
+  return clamp01(weighted / total / (n - 1));
+}
+
+/**
+ * Spectral rolloff — the normalized bin position [0, 1] below which `fraction`
+ * (default 0.85) of the total spectral energy is contained.
+ *
+ * A bright spectrum (energy toward the highs) yields a high rolloff; a dark one
+ * yields a low rolloff. Returns 0 for an empty or silent spectrum. `fraction`
+ * is clamped to (0, 1].
+ */
+export function spectralRolloff(
+  magnitudes: Float32Array | Uint8Array,
+  fraction = 0.85,
+): number {
+  const n = magnitudes.length;
+  if (n <= 1) return 0;
+  const f = fraction <= 0 ? 0 : fraction > 1 ? 1 : fraction;
+  let total = 0;
+  for (let i = 0; i < n; i++) total += magnitudes[i] ?? 0;
+  if (total <= 0) return 0;
+  const target = total * f;
+  let cumulative = 0;
+  for (let i = 0; i < n; i++) {
+    cumulative += magnitudes[i] ?? 0;
+    if (cumulative >= target) {
+      return clamp01(i / (n - 1));
+    }
+  }
+  return 1;
+}
+
+/**
+ * Crest factor mapped to [0, 1]: the ratio of a short-term (peak-ish) loudness
+ * to a long-term (sustained) loudness, expressing how punchy the moment is.
+ *
+ * Returns 0 when `long` is ~0 or when short <= long (steady / no transient),
+ * and rises toward 1 as the short-term level exceeds the sustained level. The
+ * mapping `1 - long/short` keeps the result bounded and monotonic in the ratio.
+ */
+export function crestFactor(short: number, long: number): number {
+  if (short <= 0) return 0;
+  if (long <= 0) return short > 0 ? 1 : 0;
+  if (short <= long) return 0;
+  return clamp01(1 - long / short);
+}
+
+/**
+ * Estimate tempo (BPM) from a series of onset timestamps (in seconds) using the
+ * median inter-onset interval, clamped to a musical [minBpm, maxBpm] range.
+ *
+ * Deterministic and dependency-free: no autocorrelation FFT, just the median of
+ * consecutive gaps, which is robust to the occasional missed/extra onset. The
+ * median IOI is octave-folded into the target range (doubling/halving) so a
+ * half-time or double-time interval still recovers a sensible tempo.
+ *
+ * Returns 0 when fewer than two onsets are available.
+ */
+export function estimateTempo(
+  onsetTimes: readonly number[],
+  minBpm = 60,
+  maxBpm = 200,
+): number {
+  if (onsetTimes.length < 2) return 0;
+  const intervals: number[] = [];
+  for (let i = 1; i < onsetTimes.length; i++) {
+    const dt = (onsetTimes[i] ?? 0) - (onsetTimes[i - 1] ?? 0);
+    if (dt > 0) intervals.push(dt);
+  }
+  if (intervals.length === 0) return 0;
+  intervals.sort((a, b) => a - b);
+  const mid = Math.floor(intervals.length / 2);
+  const median =
+    intervals.length % 2 === 1
+      ? (intervals[mid] ?? 0)
+      : ((intervals[mid - 1] ?? 0) + (intervals[mid] ?? 0)) / 2;
+  if (median <= 0) return 0;
+
+  let bpm = 60 / median;
+  // Octave-fold into [minBpm, maxBpm].
+  while (bpm < minBpm) bpm *= 2;
+  while (bpm > maxBpm) bpm /= 2;
+  // Final clamp in case the range is narrower than an octave.
+  if (bpm < minBpm) bpm = minBpm;
+  if (bpm > maxBpm) bpm = maxBpm;
+  return bpm;
 }
