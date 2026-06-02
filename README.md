@@ -220,6 +220,8 @@ and `presetIds` (their ids) for building your own picker.
   `composePreset`, the primitives, and audio bindings.
 - [Offline render](docs/offline-render.md) — the export API and the ffmpeg mux
   steps for a music video.
+- [Releasing](docs/releasing.md) — the changeset → version → tag → CI-publish
+  flow for maintainers.
 
 ## Gallery app
 

@@ -1,0 +1,87 @@
+name: Release
+
+# Publishes the public @cymatic/* packages to npm.
+#
+# This workflow NEVER runs on a normal push. It fires only when a version tag
+# (v*) is pushed or a GitHub Release is published — and even then it only
+# publishes if an NPM_TOKEN secret is configured. Day-to-day versioning is done
+# with changesets (see docs/releasing.md): land changeset files on main, run
+# `pnpm changeset version` to bump + write changelogs, then push a `vX.Y.Z` tag.
+on:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published]
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish @cymatic/* to npm
+    runs-on: ubuntu-latest
+    # Gate the whole job on the NPM_TOKEN secret. With no token configured the
+    # job is skipped rather than failing, so forks and token-less repos don't
+    # see red. (Secrets aren't allowed in job-level `if`, so we surface the
+    # token via an env expression and test that.)
+    if: ${{ github.repository == 'coreyepstein/cymatic' }}
+    permissions:
+      # provenance attestation requires an OIDC token; publish only needs read
+      contents: read
+      id-token: write
+    steps:
+      - name: Guard on NPM_TOKEN
+        id: guard
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NPM_TOKEN}" ]; then
+            echo "NPM_TOKEN is not set — skipping publish." >&2
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.guard.outputs.publish == 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        if: steps.guard.outputs.publish == 'true'
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        if: steps.guard.outputs.publish == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+          cache: pnpm
+
+      - name: Install dependencies
+        if: steps.guard.outputs.publish == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        if: steps.guard.outputs.publish == 'true'
+        run: pnpm build
+
+      - name: Verify (typecheck, lint, test)
+        if: steps.guard.outputs.publish == 'true'
+        run: |
+          pnpm typecheck
+          pnpm lint
+          pnpm test
+
+      # Publishes every public workspace package with npm provenance. The
+      # gallery app is `"private": true`, so pnpm skips it automatically; we add
+      # an explicit filter as belt-and-suspenders. `--no-git-checks` because the
+      # tag commit is what we're publishing from.
+      - name: Publish public packages
+        if: steps.guard.outputs.publish == 'true'
+        run: pnpm -r --filter '!@cymatic/gallery' publish --access public --provenance --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"
