@@ -11,7 +11,9 @@ describe("@cymatic/export", () => {
     expect(builtAgainstCore).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
-  it("starts with no export formats wired up", () => {
-    expect(supportedFormats).toEqual([]);
+  it("advertises the PNG sequence plus the WebCodecs video formats", () => {
+    expect(supportedFormats).toContain("png-sequence");
+    expect(supportedFormats).toContain("mp4");
+    expect(supportedFormats).toContain("webm");
   });
 });
