@@ -11,9 +11,9 @@ export default defineConfig({
         // The main gallery SPA.
         index: fileURLToPath(new URL("./index.html", import.meta.url)),
         // The V2-02 bloom verification harness (driven by e2e, not user-facing).
-        "bloom-harness": fileURLToPath(
-          new URL("./bloom-harness.html", import.meta.url),
-        ),
+        "bloom-harness": fileURLToPath(new URL("./bloom-harness.html", import.meta.url)),
+        // The V2-03 rich-primitives verification harness (e2e, not user-facing).
+        "primitives-harness": fileURLToPath(new URL("./primitives-harness.html", import.meta.url)),
       },
     },
   },

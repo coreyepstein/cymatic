@@ -39,8 +39,13 @@
 import type { GpuLike, RendererBackend } from "../capabilities.js";
 import {
   computeDrawingBufferSize,
+  expandLineToQuad,
+  type BlendMode,
   type BloomConfig,
   type DrawingBufferSize,
+  type GlowSpec,
+  type GradientFill,
+  type LineSpec,
   type NormalizedRect,
   type PostEffectsConfig,
   type RenderFeatures,
@@ -170,10 +175,7 @@ interface GpuQueueLike {
 /** A bind-group entry: a uniform buffer binding, a sampler, or a texture view. */
 interface GpuBindGroupEntryLike {
   binding: number;
-  resource:
-    | { buffer: GpuBufferLike }
-    | GpuSamplerLike
-    | GpuTextureViewLike;
+  resource: { buffer: GpuBufferLike } | GpuSamplerLike | GpuTextureViewLike;
 }
 
 interface GpuBindGroupDescriptorLike {
@@ -246,7 +248,12 @@ interface GpuRenderPassLike {
   setPipeline(pipeline: GpuRenderPipelineLike): void;
   setVertexBuffer(slot: number, buffer: GpuBufferLike): void;
   setBindGroup(index: number, bindGroup: GpuBindGroupLike): void;
-  draw(vertexCount: number, instanceCount?: number, firstVertex?: number, firstInstance?: number): void;
+  draw(
+    vertexCount: number,
+    instanceCount?: number,
+    firstVertex?: number,
+    firstInstance?: number,
+  ): void;
   end(): void;
 }
 
@@ -286,9 +293,21 @@ export interface WebgpuRendererOptions {
   gpu: GpuNavigatorLike;
 }
 
-/** Floats per instance: x, y, w, h, r, g, b, a. */
+/** Floats per RECT instance: x, y, w, h, r, g, b, a. */
 const FLOATS_PER_INSTANCE = 8;
 const BYTES_PER_INSTANCE = FLOATS_PER_INSTANCE * 4;
+
+/** Floats per GRADIENT instance: rect(4) + from(4) + to(4) + params(4). */
+const FLOATS_PER_GRADIENT = 16;
+const BYTES_PER_GRADIENT = FLOATS_PER_GRADIENT * 4;
+
+/** Floats per GLOW instance: center(4: cx,cy,radius,_) + color(4) + extra(4). */
+const FLOATS_PER_GLOW = 12;
+const BYTES_PER_GLOW = FLOATS_PER_GLOW * 4;
+
+/** Floats per LINE instance: c01(4) + c23(4) + color(4). */
+const FLOATS_PER_LINE = 12;
+const BYTES_PER_LINE = FLOATS_PER_LINE * 4;
 
 /**
  * WGSL for the instanced colored-quad SCENE pipeline. A unit quad is emitted
@@ -332,6 +351,177 @@ fn fs_main(in : VsOut) -> @location(0) vec4<f32> {
   return in.color;
 }
 `;
+
+/**
+ * WGSL for the GRADIENT pipeline. Same unit-quad expansion as the rect shader,
+ * but each instance carries `from`/`to` colors and a `mode` packed into the
+ * rect's spare lane: the per-instance buffer is `[x,y,w,h, fromRGBA, toRGBA,
+ * angle, radial, _, _]`. The fragment interpolates `from`→`to` across the rect:
+ * linear along `angle` (radians, clockwise from +x in rect-UV space) or radial
+ * from center to the farthest corner. HDR colors pass through unclamped.
+ */
+const GRADIENT_SHADER = /* wgsl */ `
+struct VsOut {
+  @builtin(position) pos : vec4<f32>,
+  @location(0) uv : vec2<f32>,
+  @location(1) fromColor : vec4<f32>,
+  @location(2) toColor : vec4<f32>,
+  @location(3) params : vec2<f32>,  // angle, radial(>0.5)
+};
+
+@vertex
+fn vs_grad(
+  @builtin(vertex_index) vi : u32,
+  @location(0) rect : vec4<f32>,       // x, y, w, h
+  @location(1) fromColor : vec4<f32>,
+  @location(2) toColor : vec4<f32>,
+  @location(3) params : vec4<f32>,     // angle, radial, _, _
+) -> VsOut {
+  var corners = array<vec2<f32>, 6>(
+    vec2<f32>(0.0, 0.0),
+    vec2<f32>(1.0, 0.0),
+    vec2<f32>(0.0, 1.0),
+    vec2<f32>(0.0, 1.0),
+    vec2<f32>(1.0, 0.0),
+    vec2<f32>(1.0, 1.0),
+  );
+  let uv = corners[vi];
+  let nx = rect.x + uv.x * rect.z;
+  let ny = rect.y + uv.y * rect.w;
+  var out : VsOut;
+  out.pos = vec4<f32>(nx * 2.0 - 1.0, 1.0 - ny * 2.0, 0.0, 1.0);
+  out.uv = uv;
+  out.fromColor = fromColor;
+  out.toColor = toColor;
+  out.params = vec2<f32>(params.x, params.y);
+  return out;
+}
+
+@fragment
+fn fs_grad(in : VsOut) -> @location(0) vec4<f32> {
+  var t : f32;
+  if (in.params.y > 0.5) {
+    // Radial: 0 at center, 1 at the farthest corner (dist to (0.5,0.5) / 0.5√2).
+    let d = in.uv - vec2<f32>(0.5, 0.5);
+    t = clamp(length(d) / 0.7071068, 0.0, 1.0);
+  } else {
+    // Linear along the angle direction, projected onto [0,1].
+    let dir = vec2<f32>(cos(in.params.x), sin(in.params.x));
+    // Project uv onto dir, remap so the rect spans [0,1] for axis-aligned angles.
+    let proj = dot(in.uv, dir);
+    // For unit-square uv, proj ranges within [min,max]; normalize by the
+    // direction's L1 footprint so 0..1 maps edge→edge for 0/90/180/270°.
+    let span = abs(dir.x) + abs(dir.y);
+    let lo = min(0.0, dir.x) + min(0.0, dir.y);
+    t = clamp((proj - lo) / max(span, 1.0e-4), 0.0, 1.0);
+  }
+  return mix(in.fromColor, in.toColor, t);
+}
+`;
+
+/**
+ * WGSL for the GLOW pipeline: a feathered, additive radial blob. Each instance
+ * is a bounding QUAD around the glow — `[cx, cy, radius, _, colorRGBA,
+ * intensity, _, _, _]` — and the fragment computes a smooth gaussian-ish falloff
+ * from center (full) to edge (zero). The color is scaled by `intensity` so the
+ * core can exceed 1.0 (HDR) and feed bloom. Drawn with additive blend.
+ */
+const GLOW_SHADER = /* wgsl */ `
+struct VsOut {
+  @builtin(position) pos : vec4<f32>,
+  @location(0) local : vec2<f32>,     // [-1,1]^2 within the glow quad
+  @location(1) color : vec4<f32>,
+  @location(2) intensity : f32,
+};
+
+@vertex
+fn vs_glow(
+  @builtin(vertex_index) vi : u32,
+  @location(0) center : vec4<f32>,    // cx, cy, radius, _
+  @location(1) color : vec4<f32>,
+  @location(2) extra : vec4<f32>,     // intensity, _, _, _
+) -> VsOut {
+  var corners = array<vec2<f32>, 6>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 1.0, -1.0),
+    vec2<f32>(-1.0,  1.0),
+    vec2<f32>(-1.0,  1.0),
+    vec2<f32>( 1.0, -1.0),
+    vec2<f32>( 1.0,  1.0),
+  );
+  let c = corners[vi];
+  let nx = center.x + c.x * center.z;
+  let ny = center.y + c.y * center.z;
+  var out : VsOut;
+  out.pos = vec4<f32>(nx * 2.0 - 1.0, 1.0 - ny * 2.0, 0.0, 1.0);
+  out.local = c;
+  out.color = color;
+  out.intensity = extra.x;
+  return out;
+}
+
+@fragment
+fn fs_glow(in : VsOut) -> @location(0) vec4<f32> {
+  let r = length(in.local);
+  // Smooth gaussian-like falloff: 1 at center → 0 at the edge (r=1).
+  let falloff = exp(-4.0 * r * r) * (1.0 - smoothstep(0.0, 1.0, r));
+  let rgb = in.color.rgb * in.intensity * falloff;
+  return vec4<f32>(rgb, in.color.a * falloff);
+}
+`;
+
+/**
+ * WGSL for the LINE pipeline: each instance carries the FOUR pre-expanded quad
+ * corners (start-left, start-right, end-left, end-right, in normalized coords)
+ * plus a color. The vertex stage selects the corner for the two triangles; the
+ * fragment is a flat color. Expansion (normal offset by width/2) is computed on
+ * the CPU via the shared `expandLineToQuad` helper. Instance layout:
+ * `[c0xy, c1xy, c2xy, c3xy, colorRGBA]` = 12 floats.
+ */
+const LINE_SHADER = /* wgsl */ `
+struct VsOut {
+  @builtin(position) pos : vec4<f32>,
+  @location(0) color : vec4<f32>,
+};
+
+@vertex
+fn vs_line(
+  @builtin(vertex_index) vi : u32,
+  @location(0) c01 : vec4<f32>,   // c0.xy, c1.xy
+  @location(1) c23 : vec4<f32>,   // c2.xy, c3.xy
+  @location(2) color : vec4<f32>,
+) -> VsOut {
+  // Two triangles from the 4 corners: [0,1,2] and [2,1,3].
+  var idx = array<u32, 6>(0u, 1u, 2u, 2u, 1u, 3u);
+  let sel = idx[vi];
+  var p : vec2<f32>;
+  if (sel == 0u) { p = c01.xy; }
+  else if (sel == 1u) { p = c01.zw; }
+  else if (sel == 2u) { p = c23.xy; }
+  else { p = c23.zw; }
+  var out : VsOut;
+  out.pos = vec4<f32>(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
+  out.color = color;
+  return out;
+}
+
+@fragment
+fn fs_line(in : VsOut) -> @location(0) vec4<f32> {
+  return in.color;
+}
+`;
+
+/** Additive blend: dst = src*1 + dst*1. Used for glows + additive primitives. */
+const ADDITIVE_BLEND: GpuBlendStateLike = {
+  color: { srcFactor: "one", dstFactor: "one", operation: "add" },
+  alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
+};
+
+/** Standard source-over alpha blend. */
+const ALPHA_BLEND: GpuBlendStateLike = {
+  color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+  alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+};
 
 /**
  * Shared fullscreen-triangle vertex stage used by every post pass. A single
@@ -510,6 +700,26 @@ interface BloomMip {
   viewB: GpuTextureViewLike;
 }
 
+/**
+ * An ordered draw command accumulated during a frame. The scene pass replays
+ * these in submission order so primitives composite correctly. Consecutive
+ * commands of the same `kind` + `blend` are coalesced into one instanced draw
+ * by {@link WebgpuRenderer.endFrame}.
+ */
+type SceneCommand =
+  | { kind: "rect"; blend: BlendMode; rect: NormalizedRect }
+  | { kind: "gradient"; blend: BlendMode; rect: NormalizedRect; fill: GradientFill }
+  | { kind: "glow"; glow: GlowSpec }
+  | { kind: "line"; blend: BlendMode; line: LineSpec };
+
+/** A coalesced run of same-kind/same-blend commands → one instanced draw. */
+interface DrawBatch {
+  kind: SceneCommand["kind"];
+  blend: BlendMode;
+  /** Indices into the per-frame command list this batch covers. */
+  commands: SceneCommand[];
+}
+
 /** Resolved (non-optional) post-FX state held by the renderer. */
 interface ResolvedBloom {
   enabled: boolean;
@@ -523,6 +733,56 @@ interface ResolvedVignette {
   amount: number;
 }
 
+/**
+ * A growable per-kind instance buffer: owns a `GPUBuffer` (vertex usage), its
+ * capacity in instances, and a CPU staging `Float32Array`. {@link ensure} grows
+ * the GPU + CPU storage to fit `count` instances; {@link upload} writes the
+ * staged data. Keeps the per-primitive buffer churn in one tested place.
+ */
+class InstanceBuffer {
+  buffer: GpuBufferLike | null = null;
+  capacity = 0;
+  data: Float32Array = new Float32Array(0);
+
+  constructor(private readonly floatsPerInstance: number) {}
+
+  private get bytesPerInstance(): number {
+    return this.floatsPerInstance * 4;
+  }
+
+  /** Grow to hold at least `count` instances (doubling, min 64). */
+  ensure(device: GpuDeviceLike, count: number): void {
+    if (this.buffer && this.capacity >= count) return;
+    const capacity = Math.max(count, this.capacity * 2, 64);
+    this.buffer?.destroy?.();
+    this.buffer = device.createBuffer({
+      size: capacity * this.bytesPerInstance,
+      usage: BUFFER_USAGE.VERTEX | BUFFER_USAGE.COPY_DST,
+    });
+    this.capacity = capacity;
+    this.data = new Float32Array(capacity * this.floatsPerInstance);
+  }
+
+  /** Upload the first `count` instances of the staged data to the GPU buffer. */
+  upload(device: GpuDeviceLike, count: number): void {
+    if (!this.buffer || count <= 0) return;
+    device.queue.writeBuffer(
+      this.buffer,
+      0,
+      this.data.buffer,
+      this.data.byteOffset,
+      count * this.bytesPerInstance,
+    );
+  }
+
+  destroy(): void {
+    this.buffer?.destroy?.();
+    this.buffer = null;
+    this.capacity = 0;
+    this.data = new Float32Array(0);
+  }
+}
+
 export class WebgpuRenderer implements Renderer {
   readonly backend: RendererBackend = "webgpu";
 
@@ -530,7 +790,22 @@ export class WebgpuRenderer implements Renderer {
   private readonly gpu: GpuNavigatorLike;
   private device: GpuDeviceLike | null = null;
   private context: GpuCanvasContextLike | null = null;
-  private scenePipeline: GpuRenderPipelineLike | null = null;
+
+  /**
+   * Scene-primitive pipelines. Each solid/gradient/line primitive comes in an
+   * alpha and an additive blend variant (selected per batch by the current
+   * blend mode); the glow is inherently additive light, so it has only the
+   * additive variant. All target the HDR offscreen texture, so bright glows feed
+   * bloom. Built once in {@link init}.
+   */
+  private rectPipelineAlpha: GpuRenderPipelineLike | null = null;
+  private rectPipelineAdd: GpuRenderPipelineLike | null = null;
+  private gradientPipelineAlpha: GpuRenderPipelineLike | null = null;
+  private gradientPipelineAdd: GpuRenderPipelineLike | null = null;
+  private linePipelineAlpha: GpuRenderPipelineLike | null = null;
+  private linePipelineAdd: GpuRenderPipelineLike | null = null;
+  private glowPipeline: GpuRenderPipelineLike | null = null;
+
   private postPipeline: GpuRenderPipelineLike | null = null;
   private postBindGroupLayout: GpuBindGroupLayoutLike | null = null;
 
@@ -546,15 +821,22 @@ export class WebgpuRenderer implements Renderer {
   private format = "bgra8unorm";
   private size: DrawingBufferSize = { width: 0, height: 0 };
 
-  /** Per-frame accumulation: the background and the rects to draw. */
+  /** Per-frame accumulation: the background and the ordered draw commands. */
   private background: RgbaColor = { r: 0, g: 0, b: 0, a: 1 };
-  private rects: NormalizedRect[] = [];
+  private commands: SceneCommand[] = [];
   private frameOpen = false;
+  /** Current blend mode for primitives issued next. Reset to alpha per frame. */
+  private blendMode: BlendMode = "alpha";
 
-  /** The instance buffer + its capacity (in instances) and CPU staging array. */
-  private instanceBuffer: GpuBufferLike | null = null;
-  private instanceCapacity = 0;
-  private instanceData: Float32Array = new Float32Array(0);
+  /**
+   * Per-kind instance buffers (+ capacity in instances and CPU staging). Each
+   * primitive kind has its own growable vertex buffer; a frame uploads each
+   * kind's instances once and the scene pass issues coalesced instanced draws.
+   */
+  private rectBuffer = new InstanceBuffer(FLOATS_PER_INSTANCE);
+  private gradientBuffer = new InstanceBuffer(FLOATS_PER_GRADIENT);
+  private glowBuffer = new InstanceBuffer(FLOATS_PER_GLOW);
+  private lineBuffer = new InstanceBuffer(FLOATS_PER_LINE);
 
   /** Offscreen HDR target (created on resize) + post-pass resources. */
   private hdrTexture: GpuTextureLike | null = null;
@@ -605,28 +887,149 @@ export class WebgpuRenderer implements Renderer {
     this.format = this.gpu.getPreferredCanvasFormat?.() ?? "bgra8unorm";
     ctx.configure({ device, format: this.format, alphaMode: "premultiplied" });
 
-    // SCENE pipeline: instanced quads → HDR offscreen target. Built ONCE.
-    const sceneModule = device.createShaderModule({ code: QUAD_SHADER });
-    this.scenePipeline = device.createRenderPipeline({
+    // SCENE PRIMITIVE pipelines → HDR offscreen target. Built ONCE. Each
+    // solid/gradient/line primitive has an alpha + additive variant; the glow is
+    // inherently additive light (one variant). The scene pass selects the right
+    // pipeline per coalesced batch.
+
+    // RECT: instanced unit quads, [rect.xyzw, color.rgba] per instance.
+    const rectModule = device.createShaderModule({ code: QUAD_SHADER });
+    const rectVertex = {
+      module: rectModule,
+      entryPoint: "vs_main",
+      buffers: [
+        {
+          arrayStride: BYTES_PER_INSTANCE,
+          stepMode: "instance" as const,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: "float32x4" },
+            { shaderLocation: 1, offset: 16, format: "float32x4" },
+          ],
+        },
+      ],
+    };
+    this.rectPipelineAlpha = device.createRenderPipeline({
+      layout: "auto",
+      vertex: rectVertex,
+      fragment: {
+        module: rectModule,
+        entryPoint: "fs_main",
+        targets: [{ format: HDR_FORMAT, blend: ALPHA_BLEND }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+    this.rectPipelineAdd = device.createRenderPipeline({
+      layout: "auto",
+      vertex: rectVertex,
+      fragment: {
+        module: rectModule,
+        entryPoint: "fs_main",
+        targets: [{ format: HDR_FORMAT, blend: ADDITIVE_BLEND }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+
+    // GRADIENT: instanced quads with [rect, from, to, params] per instance.
+    const gradientModule = device.createShaderModule({ code: GRADIENT_SHADER });
+    const gradientVertex = {
+      module: gradientModule,
+      entryPoint: "vs_grad",
+      buffers: [
+        {
+          arrayStride: BYTES_PER_GRADIENT,
+          stepMode: "instance" as const,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: "float32x4" },
+            { shaderLocation: 1, offset: 16, format: "float32x4" },
+            { shaderLocation: 2, offset: 32, format: "float32x4" },
+            { shaderLocation: 3, offset: 48, format: "float32x4" },
+          ],
+        },
+      ],
+    };
+    this.gradientPipelineAlpha = device.createRenderPipeline({
+      layout: "auto",
+      vertex: gradientVertex,
+      fragment: {
+        module: gradientModule,
+        entryPoint: "fs_grad",
+        targets: [{ format: HDR_FORMAT, blend: ALPHA_BLEND }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+    this.gradientPipelineAdd = device.createRenderPipeline({
+      layout: "auto",
+      vertex: gradientVertex,
+      fragment: {
+        module: gradientModule,
+        entryPoint: "fs_grad",
+        targets: [{ format: HDR_FORMAT, blend: ADDITIVE_BLEND }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+
+    // GLOW: instanced feathered quads, [center(cx,cy,r,_), color, extra(intensity)].
+    const glowModule = device.createShaderModule({ code: GLOW_SHADER });
+    this.glowPipeline = device.createRenderPipeline({
       layout: "auto",
       vertex: {
-        module: sceneModule,
-        entryPoint: "vs_main",
+        module: glowModule,
+        entryPoint: "vs_glow",
         buffers: [
           {
-            arrayStride: BYTES_PER_INSTANCE,
+            arrayStride: BYTES_PER_GLOW,
             stepMode: "instance",
             attributes: [
               { shaderLocation: 0, offset: 0, format: "float32x4" },
               { shaderLocation: 1, offset: 16, format: "float32x4" },
+              { shaderLocation: 2, offset: 32, format: "float32x4" },
             ],
           },
         ],
       },
       fragment: {
-        module: sceneModule,
-        entryPoint: "fs_main",
-        targets: [{ format: HDR_FORMAT }],
+        module: glowModule,
+        entryPoint: "fs_glow",
+        // Glows always accumulate light additively.
+        targets: [{ format: HDR_FORMAT, blend: ADDITIVE_BLEND }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+
+    // LINE: instanced quads from 4 pre-expanded corners, [c01, c23, color].
+    const lineModule = device.createShaderModule({ code: LINE_SHADER });
+    const lineVertex = {
+      module: lineModule,
+      entryPoint: "vs_line",
+      buffers: [
+        {
+          arrayStride: BYTES_PER_LINE,
+          stepMode: "instance" as const,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: "float32x4" },
+            { shaderLocation: 1, offset: 16, format: "float32x4" },
+            { shaderLocation: 2, offset: 32, format: "float32x4" },
+          ],
+        },
+      ],
+    };
+    this.linePipelineAlpha = device.createRenderPipeline({
+      layout: "auto",
+      vertex: lineVertex,
+      fragment: {
+        module: lineModule,
+        entryPoint: "fs_line",
+        targets: [{ format: HDR_FORMAT, blend: ALPHA_BLEND }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+    this.linePipelineAdd = device.createRenderPipeline({
+      layout: "auto",
+      vertex: lineVertex,
+      fragment: {
+        module: lineModule,
+        entryPoint: "fs_line",
+        targets: [{ format: HDR_FORMAT, blend: ADDITIVE_BLEND }],
       },
       primitive: { topology: "triangle-list" },
     });
@@ -812,24 +1215,53 @@ export class WebgpuRenderer implements Renderer {
   beginFrame(background: RgbaColor): void {
     this.require("beginFrame");
     this.background = { ...background };
-    this.rects = [];
+    this.commands = [];
+    this.blendMode = "alpha";
     this.frameOpen = true;
+  }
+
+  setBlendMode(mode: BlendMode): void {
+    this.blendMode = mode;
   }
 
   drawRect(rect: NormalizedRect): void {
     this.require("drawRect");
-    if (!this.frameOpen) {
-      throw new Error("WebgpuRenderer: drawRect() called outside beginFrame().");
-    }
+    this.requireFrame("drawRect");
     if (rect.w <= 0 || rect.h <= 0) return;
-    this.rects.push(rect);
+    this.commands.push({ kind: "rect", blend: this.blendMode, rect });
+  }
+
+  drawGradientRect(rect: NormalizedRect, fill: GradientFill): void {
+    this.require("drawGradientRect");
+    this.requireFrame("drawGradientRect");
+    if (rect.w <= 0 || rect.h <= 0) return;
+    this.commands.push({ kind: "gradient", blend: this.blendMode, rect, fill });
+  }
+
+  drawGlow(glow: GlowSpec): void {
+    this.require("drawGlow");
+    this.requireFrame("drawGlow");
+    if (glow.radius <= 0) return;
+    // Glow is always additive light; blend mode does not apply to it.
+    this.commands.push({ kind: "glow", glow });
+  }
+
+  drawLine(line: LineSpec): void {
+    this.require("drawLine");
+    this.requireFrame("drawLine");
+    if (line.width <= 0) return;
+    this.commands.push({ kind: "line", blend: this.blendMode, line });
+  }
+
+  private requireFrame(op: string): void {
+    if (!this.frameOpen) {
+      throw new Error(`WebgpuRenderer: ${op}() called outside beginFrame().`);
+    }
   }
 
   endFrame(): void {
-    const { device, context, scenePipeline, postPipeline } = this.require("endFrame");
-    if (!this.frameOpen) {
-      throw new Error("WebgpuRenderer: endFrame() called outside beginFrame().");
-    }
+    const { device, context, postPipeline } = this.require("endFrame");
+    this.requireFrame("endFrame");
     this.frameOpen = false;
 
     if (!this.hdrView || !this.postBindGroup) {
@@ -841,30 +1273,11 @@ export class WebgpuRenderer implements Renderer {
       throw new Error("WebgpuRenderer: offscreen HDR target unavailable.");
     }
 
-    const count = this.rects.length;
-    if (count > 0) {
-      this.ensureInstanceCapacity(device, count);
-      const data = this.instanceData;
-      for (let i = 0; i < count; i++) {
-        const rect = this.rects[i]!;
-        const base = i * FLOATS_PER_INSTANCE;
-        data[base] = rect.x;
-        data[base + 1] = rect.y;
-        data[base + 2] = rect.w;
-        data[base + 3] = rect.h;
-        data[base + 4] = rect.color.r;
-        data[base + 5] = rect.color.g;
-        data[base + 6] = rect.color.b;
-        data[base + 7] = rect.color.a;
-      }
-      device.queue.writeBuffer(
-        this.instanceBuffer!,
-        0,
-        data.buffer,
-        data.byteOffset,
-        count * BYTES_PER_INSTANCE,
-      );
-    }
+    // Coalesce the ordered command list into batches (runs of same kind+blend),
+    // stage each kind's instances into its growable buffer, and remember the
+    // per-batch instance offset so the scene pass can issue one draw per batch.
+    const batches = coalesce(this.commands);
+    const staged = this.stageBatches(device, batches);
 
     // Upload composite params (exposure, bloom intensity, vignette) when dirty.
     if (this.postParamsDirty && this.postUniformBuffer) {
@@ -897,10 +1310,12 @@ export class WebgpuRenderer implements Renderer {
         },
       ],
     });
-    scenePass.setPipeline(scenePipeline);
-    if (count > 0) {
-      scenePass.setVertexBuffer(0, this.instanceBuffer!);
-      scenePass.draw(6, count);
+    // Replay batches IN ORDER so primitives composite correctly. Each batch sets
+    // its pipeline + vertex buffer (per kind/blend) and issues ONE instanced draw.
+    for (const draw of staged) {
+      scenePass.setPipeline(draw.pipeline);
+      scenePass.setVertexBuffer(0, draw.buffer);
+      scenePass.draw(6, draw.instanceCount, 0, draw.firstInstance);
     }
     scenePass.end();
 
@@ -967,7 +1382,12 @@ export class WebgpuRenderer implements Renderer {
 
     // 1) BRIGHT-PASS: HDR scene → mip0.texA. threshold in uniform.x.
     this.writeBloomUniform(device, this.bloom.threshold, 0, 0, this.bloom.radius);
-    this.fullscreenPass(encoder, mip0.viewA, bright, this.makeBloomBindGroup(device, bloomLayout, sampler, bloomUniform, hdrView));
+    this.fullscreenPass(
+      encoder,
+      mip0.viewA,
+      bright,
+      this.makeBloomBindGroup(device, bloomLayout, sampler, bloomUniform, hdrView),
+    );
 
     // 2) Per-mip blur (H then V) ending in texA, then downsample to next mip.
     for (let i = 0; i < mips.length; i++) {
@@ -1170,40 +1590,133 @@ export class WebgpuRenderer implements Renderer {
     this.bloomMips = [];
   }
 
-  /** Grow (or first-create) the instance buffer to hold at least `count` rects. */
-  private ensureInstanceCapacity(device: GpuDeviceLike, count: number): void {
-    if (this.instanceBuffer && this.instanceCapacity >= count) return;
-    const capacity = Math.max(count, this.instanceCapacity * 2, 64);
-    this.instanceBuffer?.destroy?.();
-    this.instanceBuffer = device.createBuffer({
-      size: capacity * BYTES_PER_INSTANCE,
-      usage: BUFFER_USAGE.VERTEX | BUFFER_USAGE.COPY_DST,
-    });
-    this.instanceCapacity = capacity;
-    this.instanceData = new Float32Array(capacity * FLOATS_PER_INSTANCE);
+  /**
+   * Stage every batch's instances into its per-kind buffer, upload once per
+   * kind, and return the per-batch GPU draw descriptors (pipeline + buffer +
+   * instance range) in batch order. Instances for each kind are packed
+   * contiguously across batches of that kind, so `firstInstance` lets each batch
+   * draw its slice from the single shared buffer.
+   */
+  private stageBatches(device: GpuDeviceLike, batches: DrawBatch[]): StagedDraw[] {
+    // Count instances per kind to size each buffer once.
+    let rectN = 0;
+    let gradN = 0;
+    let glowN = 0;
+    let lineN = 0;
+    for (const b of batches) {
+      if (b.kind === "rect") rectN += b.commands.length;
+      else if (b.kind === "gradient") gradN += b.commands.length;
+      else if (b.kind === "glow") glowN += b.commands.length;
+      else lineN += b.commands.length;
+    }
+    if (rectN) this.rectBuffer.ensure(device, rectN);
+    if (gradN) this.gradientBuffer.ensure(device, gradN);
+    if (glowN) this.glowBuffer.ensure(device, glowN);
+    if (lineN) this.lineBuffer.ensure(device, lineN);
+
+    const staged: StagedDraw[] = [];
+    let rectCursor = 0;
+    let gradCursor = 0;
+    let glowCursor = 0;
+    let lineCursor = 0;
+    for (const b of batches) {
+      const count = b.commands.length;
+      if (count === 0) continue;
+      if (b.kind === "rect") {
+        const first = rectCursor;
+        for (const cmd of b.commands) {
+          if (cmd.kind !== "rect") continue;
+          writeRectInstance(this.rectBuffer.data, rectCursor, cmd.rect);
+          rectCursor++;
+        }
+        staged.push({
+          pipeline: b.blend === "additive" ? this.rectPipelineAdd! : this.rectPipelineAlpha!,
+          buffer: this.rectBuffer.buffer!,
+          firstInstance: first,
+          instanceCount: count,
+        });
+      } else if (b.kind === "gradient") {
+        const first = gradCursor;
+        for (const cmd of b.commands) {
+          if (cmd.kind !== "gradient") continue;
+          writeGradientInstance(this.gradientBuffer.data, gradCursor, cmd.rect, cmd.fill);
+          gradCursor++;
+        }
+        staged.push({
+          pipeline:
+            b.blend === "additive" ? this.gradientPipelineAdd! : this.gradientPipelineAlpha!,
+          buffer: this.gradientBuffer.buffer!,
+          firstInstance: first,
+          instanceCount: count,
+        });
+      } else if (b.kind === "glow") {
+        const first = glowCursor;
+        for (const cmd of b.commands) {
+          if (cmd.kind !== "glow") continue;
+          writeGlowInstance(this.glowBuffer.data, glowCursor, cmd.glow);
+          glowCursor++;
+        }
+        staged.push({
+          pipeline: this.glowPipeline!,
+          buffer: this.glowBuffer.buffer!,
+          firstInstance: first,
+          instanceCount: count,
+        });
+      } else {
+        const first = lineCursor;
+        for (const cmd of b.commands) {
+          if (cmd.kind !== "line") continue;
+          writeLineInstance(this.lineBuffer.data, lineCursor, cmd.line);
+          lineCursor++;
+        }
+        staged.push({
+          pipeline: b.blend === "additive" ? this.linePipelineAdd! : this.linePipelineAlpha!,
+          buffer: this.lineBuffer.buffer!,
+          firstInstance: first,
+          instanceCount: count,
+        });
+      }
+    }
+
+    // Upload each kind's staged data once.
+    if (rectN) this.rectBuffer.upload(device, rectN);
+    if (gradN) this.gradientBuffer.upload(device, gradN);
+    if (glowN) this.glowBuffer.upload(device, glowN);
+    if (lineN) this.lineBuffer.upload(device, lineN);
+
+    return staged;
   }
 
   private require(op: string): {
     device: GpuDeviceLike;
     context: GpuCanvasContextLike;
-    scenePipeline: GpuRenderPipelineLike;
     postPipeline: GpuRenderPipelineLike;
   } {
     const device = this.device;
     const context = this.context;
-    const scenePipeline = this.scenePipeline;
     const postPipeline = this.postPipeline;
-    if (!device || !context || !scenePipeline || !postPipeline) {
+    if (
+      !device ||
+      !context ||
+      !postPipeline ||
+      !this.rectPipelineAlpha ||
+      !this.rectPipelineAdd ||
+      !this.gradientPipelineAlpha ||
+      !this.gradientPipelineAdd ||
+      !this.glowPipeline ||
+      !this.linePipelineAlpha ||
+      !this.linePipelineAdd
+    ) {
       throw new Error(`WebgpuRenderer: ${op}() called before init().`);
     }
-    return { device, context, scenePipeline, postPipeline };
+    return { device, context, postPipeline };
   }
 
   dispose(): void {
-    this.instanceBuffer?.destroy?.();
-    this.instanceBuffer = null;
-    this.instanceCapacity = 0;
-    this.instanceData = new Float32Array(0);
+    this.rectBuffer.destroy();
+    this.gradientBuffer.destroy();
+    this.glowBuffer.destroy();
+    this.lineBuffer.destroy();
     this.hdrTexture?.destroy?.();
     this.hdrTexture = null;
     this.hdrView = null;
@@ -1217,7 +1730,13 @@ export class WebgpuRenderer implements Renderer {
     this.bloomBindGroupLayout = null;
     this.upsampleBindGroupLayout = null;
     this.sampler = null;
-    this.scenePipeline = null;
+    this.rectPipelineAlpha = null;
+    this.rectPipelineAdd = null;
+    this.gradientPipelineAlpha = null;
+    this.gradientPipelineAdd = null;
+    this.linePipelineAlpha = null;
+    this.linePipelineAdd = null;
+    this.glowPipeline = null;
     this.postPipeline = null;
     this.brightPipeline = null;
     this.blurPipeline = null;
@@ -1225,7 +1744,8 @@ export class WebgpuRenderer implements Renderer {
     this.context?.unconfigure?.();
     this.context = null;
     this.device = null;
-    this.rects = [];
+    this.commands = [];
+    this.blendMode = "alpha";
     this.frameOpen = false;
     this.exposure = DEFAULT_EXPOSURE;
     this.bloom = {
@@ -1242,4 +1762,109 @@ export class WebgpuRenderer implements Renderer {
 /** Clamp a value to a finite, non-negative number, falling back to `fallback`. */
 function clampNonNegative(value: number, fallback: number): number {
   return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+/** A resolved per-batch GPU draw: which pipeline + buffer + instance range. */
+interface StagedDraw {
+  pipeline: GpuRenderPipelineLike;
+  buffer: GpuBufferLike;
+  firstInstance: number;
+  instanceCount: number;
+}
+
+/**
+ * Coalesce an ordered command list into runs of the same `kind` + `blend`, so a
+ * run of consecutive same-type primitives becomes ONE instanced draw. Order is
+ * preserved exactly, so compositing is identical to issuing the commands one at
+ * a time. Glow commands carry no blend (always additive); they coalesce on kind
+ * alone. Exported-internal pure helper — unit tested directly.
+ */
+export function coalesce(commands: SceneCommand[]): DrawBatch[] {
+  const batches: DrawBatch[] = [];
+  for (const cmd of commands) {
+    const blend: BlendMode = cmd.kind === "glow" ? "additive" : cmd.blend;
+    const last = batches[batches.length - 1];
+    if (last && last.kind === cmd.kind && last.blend === blend) {
+      last.commands.push(cmd);
+    } else {
+      batches.push({ kind: cmd.kind, blend, commands: [cmd] });
+    }
+  }
+  return batches;
+}
+
+/** Write a rect instance [x,y,w,h, r,g,b,a] at `index` into `data`. */
+function writeRectInstance(data: Float32Array, index: number, rect: NormalizedRect): void {
+  const base = index * FLOATS_PER_INSTANCE;
+  data[base] = rect.x;
+  data[base + 1] = rect.y;
+  data[base + 2] = rect.w;
+  data[base + 3] = rect.h;
+  data[base + 4] = rect.color.r;
+  data[base + 5] = rect.color.g;
+  data[base + 6] = rect.color.b;
+  data[base + 7] = rect.color.a;
+}
+
+/** Write a gradient instance [rect(4), from(4), to(4), params(4)] at `index`. */
+function writeGradientInstance(
+  data: Float32Array,
+  index: number,
+  rect: NormalizedRect,
+  fill: GradientFill,
+): void {
+  const base = index * FLOATS_PER_GRADIENT;
+  data[base] = rect.x;
+  data[base + 1] = rect.y;
+  data[base + 2] = rect.w;
+  data[base + 3] = rect.h;
+  data[base + 4] = fill.from.r;
+  data[base + 5] = fill.from.g;
+  data[base + 6] = fill.from.b;
+  data[base + 7] = fill.from.a;
+  data[base + 8] = fill.to.r;
+  data[base + 9] = fill.to.g;
+  data[base + 10] = fill.to.b;
+  data[base + 11] = fill.to.a;
+  data[base + 12] = Number.isFinite(fill.angle) ? (fill.angle as number) : 0;
+  data[base + 13] = fill.radial ? 1 : 0;
+  data[base + 14] = 0;
+  data[base + 15] = 0;
+}
+
+/** Write a glow instance [cx,cy,radius,_, color(4), intensity,_,_,_] at `index`. */
+function writeGlowInstance(data: Float32Array, index: number, glow: GlowSpec): void {
+  const base = index * FLOATS_PER_GLOW;
+  const intensity =
+    glow.intensity == null || !Number.isFinite(glow.intensity) ? 1 : Math.max(glow.intensity, 0);
+  data[base] = glow.x;
+  data[base + 1] = glow.y;
+  data[base + 2] = glow.radius;
+  data[base + 3] = 0;
+  data[base + 4] = glow.color.r;
+  data[base + 5] = glow.color.g;
+  data[base + 6] = glow.color.b;
+  data[base + 7] = glow.color.a;
+  data[base + 8] = intensity;
+  data[base + 9] = 0;
+  data[base + 10] = 0;
+  data[base + 11] = 0;
+}
+
+/** Write a line instance [c0.xy, c1.xy, c2.xy, c3.xy, color(4)] at `index`. */
+function writeLineInstance(data: Float32Array, index: number, line: LineSpec): void {
+  const [c0, c1, c2, c3] = expandLineToQuad(line);
+  const base = index * FLOATS_PER_LINE;
+  data[base] = c0.x;
+  data[base + 1] = c0.y;
+  data[base + 2] = c1.x;
+  data[base + 3] = c1.y;
+  data[base + 4] = c2.x;
+  data[base + 5] = c2.y;
+  data[base + 6] = c3.x;
+  data[base + 7] = c3.y;
+  data[base + 8] = line.color.r;
+  data[base + 9] = line.color.g;
+  data[base + 10] = line.color.b;
+  data[base + 11] = line.color.a;
 }

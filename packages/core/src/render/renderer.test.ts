@@ -4,6 +4,9 @@ import type { RendererEnvironment } from "./capabilities.js";
 import {
   computeDrawingBufferSize,
   createRenderer,
+  expandLineToQuad,
+  lineBoundsRect,
+  normalizedToClip,
   toRgba,
   type RenderCanvasLike,
   type Renderer,
@@ -51,18 +54,59 @@ describe("toRgba", () => {
   });
 });
 
-/** A fake canvas usable by both backends; records context requests. */
-function makeFakeCanvas() {
+/**
+ * A fake canvas usable by both backends; records context requests. The `gl`
+ * stub now models the small slice the WebGL renderer's shader-quad path uses
+ * (programs/buffers/uniforms/blend) so the renderer builds its program and
+ * draws the new primitives through the real (mocked) GL calls. `withShader`
+ * (default true) controls whether shader creation succeeds; pass `false` to
+ * exercise the scissor-clear fallback path.
+ */
+function makeFakeCanvas(opts: { withShader?: boolean } = {}) {
+  const withShader = opts.withShader ?? true;
   const contexts: string[] = [];
   const gl = {
     COLOR_BUFFER_BIT: 0x4000,
     SCISSOR_TEST: 0x0c11,
+    BLEND: 0x0be2,
+    SRC_ALPHA: 0x0302,
+    ONE: 1,
+    ONE_MINUS_SRC_ALPHA: 0x0303,
+    TRIANGLES: 0x0004,
+    TRIANGLE_STRIP: 0x0005,
+    ARRAY_BUFFER: 0x8892,
+    STATIC_DRAW: 0x88e4,
+    DYNAMIC_DRAW: 0x88e8,
+    FLOAT: 0x1406,
+    VERTEX_SHADER: 0x8b31,
+    FRAGMENT_SHADER: 0x8b30,
+    COMPILE_STATUS: 0x8b81,
+    LINK_STATUS: 0x8b82,
     viewport: vi.fn(),
     clearColor: vi.fn(),
     clear: vi.fn(),
     enable: vi.fn(),
     disable: vi.fn(),
     scissor: vi.fn(),
+    blendFunc: vi.fn(),
+    createShader: vi.fn(() => (withShader ? { __brand: "shader" } : null)),
+    shaderSource: vi.fn(),
+    compileShader: vi.fn(),
+    getShaderParameter: vi.fn(() => withShader),
+    createProgram: vi.fn(() => (withShader ? { __brand: "program" } : null)),
+    attachShader: vi.fn(),
+    linkProgram: vi.fn(),
+    getProgramParameter: vi.fn(() => withShader),
+    useProgram: vi.fn(),
+    createBuffer: vi.fn(() => ({ __brand: "buffer" })),
+    bindBuffer: vi.fn(),
+    bufferData: vi.fn(),
+    getAttribLocation: vi.fn(() => 0),
+    enableVertexAttribArray: vi.fn(),
+    vertexAttribPointer: vi.fn(),
+    getUniformLocation: vi.fn((_p: unknown, name: string) => ({ name })),
+    uniform4f: vi.fn(),
+    drawArrays: vi.fn(),
   };
   const canvas: RenderCanvasLike = {
     width: 0,
@@ -245,9 +289,11 @@ describe("preset-facing call path is backend-agnostic", () => {
     };
     expect(sceneDesc.colorAttachments[0]?.loadOp).toBe("clear");
     expect(sceneDesc.colorAttachments[0]?.clearValue).toEqual({ r: 0.1, g: 0.2, b: 0.3, a: 1 });
-    // Five pipelines are built once in init() (scene + bright + blur + upsample
-    // + post). With bloom off only the scene + post are BOUND this frame.
-    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(5);
+    // Eleven pipelines are built once in init(): the scene primitives (rect
+    // alpha+add, gradient alpha+add, glow, line alpha+add = 7) + bloom (bright +
+    // blur + upsample = 3) + post (1). With bloom off only the rect scene
+    // pipeline + post are BOUND this frame.
+    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(11);
     // The offscreen HDR target is allocated as an rgba16float texture.
     expect(harness.createTexture).toHaveBeenCalled();
     const texDesc = harness.createTexture.mock.calls[0]?.[0] as { format: string };
@@ -322,7 +368,10 @@ function makeWebgpuHarness() {
   };
   const gpuCtx = {
     configure: vi.fn(),
-    getCurrentTexture: () => ({ createView: () => ({ __brand: "view" as const }), destroy: vi.fn() }),
+    getCurrentTexture: () => ({
+      createView: () => ({ __brand: "view" as const }),
+      destroy: vi.fn(),
+    }),
   };
   const canvas: RenderCanvasLike = {
     width: 0,
@@ -360,8 +409,31 @@ function makeWebgpuHarness() {
 }
 
 describe("drawRect primitive (backend-agnostic)", () => {
-  it("webgl draws a rect via a scissored clear in device pixels", async () => {
+  it("webgl draws a rect via the shader-quad path (uniforms + drawArrays)", async () => {
     const { canvas, gl } = makeFakeCanvas();
+    const renderer = createRenderer(canvas, {
+      environment: { gpu: null, hasWebgl: () => true },
+    });
+    await renderer.init();
+    renderer.resize(100, 100, 2); // backing store 200x200
+
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.drawRect({ x: 0, y: 0, w: 0.5, h: 0.5, color: { r: 1, g: 0, b: 0, a: 1 } });
+    renderer.endFrame();
+
+    // Frame clears to the background.
+    expect(gl.clearColor).toHaveBeenCalledWith(0, 0, 0, 1);
+    // The rect is drawn as a shader quad: its rect + color reach uniforms and a
+    // single 4-vertex triangle-strip draw is issued.
+    expect(gl.uniform4f).toHaveBeenCalledWith({ name: "u_rect" }, 0, 0, 0.5, 0.5);
+    expect(gl.uniform4f).toHaveBeenCalledWith({ name: "u_color" }, 1, 0, 0, 1);
+    expect(gl.drawArrays).toHaveBeenCalledWith(gl.TRIANGLE_STRIP, 0, 4);
+    // Default blend mode is alpha (src_alpha, one_minus_src_alpha).
+    expect(gl.blendFunc).toHaveBeenLastCalledWith(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  });
+
+  it("webgl falls back to a scissored clear when no shader program is available", async () => {
+    const { canvas, gl } = makeFakeCanvas({ withShader: false });
     const renderer = createRenderer(canvas, {
       environment: { gpu: null, hasWebgl: () => true },
     });
@@ -376,9 +448,9 @@ describe("drawRect primitive (backend-agnostic)", () => {
     expect(gl.enable).toHaveBeenCalledWith(gl.SCISSOR_TEST);
     // device px: x=0, w=100, h=100, y = (1 - 0 - 0.5)*200 = 100
     expect(gl.scissor).toHaveBeenCalledWith(0, 100, 100, 100);
-    expect(gl.clearColor).toHaveBeenLastCalledWith(1, 0, 0, 1);
-    // Scissor is disabled again at endFrame so it can't leak.
-    expect(gl.disable).toHaveBeenLastCalledWith(gl.SCISSOR_TEST);
+    expect(gl.clearColor).toHaveBeenCalledWith(1, 0, 0, 1);
+    // drawArrays never used on the fallback path.
+    expect(gl.drawArrays).not.toHaveBeenCalled();
   });
 
   it("webgl skips zero-area rects", async () => {
@@ -389,10 +461,10 @@ describe("drawRect primitive (backend-agnostic)", () => {
     await renderer.init();
     renderer.resize(100, 100, 1);
     renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
-    gl.scissor.mockClear();
+    gl.drawArrays.mockClear();
     renderer.drawRect({ x: 0, y: 0, w: 0, h: 0.5, color: { r: 1, g: 1, b: 1, a: 1 } });
     renderer.endFrame();
-    expect(gl.scissor).not.toHaveBeenCalled();
+    expect(gl.drawArrays).not.toHaveBeenCalled();
   });
 
   it("webgpu draws rects via ONE instanced draw into the offscreen scene pass, not per-rect clears", async () => {
@@ -433,7 +505,10 @@ describe("drawRect primitive (backend-agnostic)", () => {
     // Pass 1 (scene) does the instanced draw; pass 2 (post) draws the fullscreen triangle.
     expect(harness.drawsByPass[0]).toEqual([[6, 3]]);
     expect(harness.drawsByPass[1]).toEqual([[3, 1]]);
-    expect(harness.drawCalls).toEqual([[6, 3], [3, 1]]);
+    expect(harness.drawCalls).toEqual([
+      [6, 3],
+      [3, 1],
+    ]);
     // Instance data uploaded once for this frame; one submit batches both passes.
     expect(harness.submit).toHaveBeenCalledTimes(1);
   });
@@ -469,17 +544,21 @@ describe("drawRect primitive (backend-agnostic)", () => {
       renderer.endFrame();
     }
 
-    // Five pipelines (scene + bright + blur + upsample + post), five shader
-    // modules — all built once in init().
-    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(5);
-    expect(harness.createShaderModule).toHaveBeenCalledTimes(5);
+    // Eleven pipelines (7 scene primitive variants + bright + blur + upsample +
+    // post) from eight shader modules (rect, gradient, glow, line, bright, blur,
+    // upsample, post) — all built once in init().
+    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(11);
+    expect(harness.createShaderModule).toHaveBeenCalledTimes(8);
     // With bloom off, two passes per frame (scene + post) => 6 across 3 frames.
     expect(harness.passDescriptors).toHaveLength(6);
     // Each frame: instanced scene draw then fullscreen post draw.
     expect(harness.drawCalls).toEqual([
-      [6, 1], [3, 1],
-      [6, 1], [3, 1],
-      [6, 1], [3, 1],
+      [6, 1],
+      [3, 1],
+      [6, 1],
+      [3, 1],
+      [6, 1],
+      [3, 1],
     ]);
   });
 });
@@ -612,8 +691,8 @@ describe("HDR offscreen target + post-processing framework (V2-01)", () => {
     renderer.resize(100, 100, 1);
 
     // Must accept the call (including bloom + vignette) without throwing and
-    // without altering its direct render path: a subsequent frame still clears
-    // + scissors as before. WebGL keeps its basic look — post-FX is a no-op.
+    // without altering its direct render path: a subsequent frame still draws
+    // the rect as before. WebGL keeps its basic look — post-FX is a no-op.
     expect(() =>
       renderer.setPostEffects({
         exposure: 3,
@@ -625,8 +704,9 @@ describe("HDR offscreen target + post-processing framework (V2-01)", () => {
     renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
     renderer.drawRect({ x: 0, y: 0, w: 0.5, h: 0.5, color: { r: 1, g: 0, b: 0, a: 1 } });
     renderer.endFrame();
-    // Still rendering directly (scissored clear), unaffected by post-FX config.
-    expect(gl.scissor).toHaveBeenCalled();
+    // Still rendering directly (the basic shader-quad path), unaffected by
+    // post-FX config.
+    expect(gl.drawArrays).toHaveBeenCalled();
   });
 
   it("setPostEffects is part of the backend-agnostic Renderer surface (no backend branch)", () => {
@@ -642,9 +722,7 @@ describe("HDR offscreen target + post-processing framework (V2-01)", () => {
 });
 
 /** Decode every writeBuffer call's payload as a Float32Array of its 4 floats. */
-function decodeUniformWrites(
-  writeBuffer: ReturnType<typeof vi.fn>,
-): number[][] {
+function decodeUniformWrites(writeBuffer: ReturnType<typeof vi.fn>): number[][] {
   return writeBuffer.mock.calls.map((c) => {
     const data = c[2] as ArrayBufferLike | ArrayBufferView;
     const view =
@@ -668,9 +746,7 @@ function decodeUniformWrites(
 function writesContainVec(writes: number[][], expected: number[]): boolean {
   const eps = 1e-5;
   return writes.some(
-    (w) =>
-      w.length === expected.length &&
-      w.every((v, i) => Math.abs(v - expected[i]!) < eps),
+    (w) => w.length === expected.length && w.every((v, i) => Math.abs(v - expected[i]!) < eps),
   );
 }
 
@@ -702,9 +778,7 @@ describe("bloom + vignette post-FX (V2-02)", () => {
     // Bloom-on runs strictly more passes (bright + blur + downsample + upsample
     // + scene + post). With 4 mips: scene(1) + bright(1) + blur H/V ×4 (8) +
     // downsample ×3 (3) + upsample-accumulate ×3 (3) + post(1) = 17.
-    expect(onHarness.passDescriptors.length).toBeGreaterThan(
-      offHarness.passDescriptors.length,
-    );
+    expect(onHarness.passDescriptors.length).toBeGreaterThan(offHarness.passDescriptors.length);
     expect(onHarness.passDescriptors).toHaveLength(17);
     // The bright-pass + every blur/upsample is a fullscreen-triangle draw(3,1);
     // the scene pass draws the instanced quad once. So bloom-on has many more
@@ -719,15 +793,15 @@ describe("bloom + vignette post-FX (V2-02)", () => {
     expect(onHarness.submit).toHaveBeenCalledTimes(1);
   });
 
-  it("builds five pipelines (scene + bright + blur + upsample + post) once", async () => {
+  it("builds eleven pipelines (scene primitives + bloom + post) once", async () => {
     const harness = makeWebgpuHarness();
     const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
     await renderer.init();
     renderer.resize(64, 64, 1);
-    // The bloom stage needs four dedicated pipelines beyond the scene + post
-    // pipelines; all are built exactly once in init().
-    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(5);
-    expect(harness.createShaderModule).toHaveBeenCalledTimes(5);
+    // Seven scene-primitive pipelines (rect/gradient/line ×{alpha,additive} +
+    // glow) + bloom (bright + blur + upsample) + post — all built once in init().
+    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(11);
+    expect(harness.createShaderModule).toHaveBeenCalledTimes(8);
   });
 
   it("honours bloom + vignette config: the composite uniform records the values", async () => {
@@ -799,5 +873,358 @@ describe("bloom + vignette post-FX (V2-02)", () => {
 
     const writes = decodeUniformWrites(harness.writeBuffer);
     expect(writesContainVec(writes, [1, 0.6, 1, 1])).toBe(true);
+  });
+});
+
+/** Decode a writeBuffer payload (whole buffer) into a full Float32Array. */
+function decodeWrite(data: ArrayBufferLike | ArrayBufferView): Float32Array {
+  return data instanceof ArrayBuffer
+    ? new Float32Array(data)
+    : new Float32Array(
+        (data as ArrayBufferView).buffer,
+        (data as ArrayBufferView).byteOffset,
+        (data as ArrayBufferView).byteLength / 4,
+      );
+}
+
+/** All writeBuffer payloads (whole-buffer) decoded as Float32Arrays. */
+function allWrites(writeBuffer: ReturnType<typeof vi.fn>): Float32Array[] {
+  return writeBuffer.mock.calls.map((c) => decodeWrite(c[2] as ArrayBufferLike | ArrayBufferView));
+}
+
+/** True when some write contains `seq` as a contiguous subsequence (float32 eps). */
+function someWriteContainsSeq(writes: Float32Array[], seq: number[]): boolean {
+  const eps = 1e-5;
+  return writes.some((w) => {
+    for (let start = 0; start + seq.length <= w.length; start++) {
+      let ok = true;
+      for (let i = 0; i < seq.length; i++) {
+        if (Math.abs(w[start + i]! - seq[i]!) > eps) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return true;
+    }
+    return false;
+  });
+}
+
+describe("rich primitives — pure helpers (V2-03)", () => {
+  it("expandLineToQuad offsets a horizontal segment by ±width/2 along its normal", () => {
+    const corners = expandLineToQuad({ x0: 0.2, y0: 0.5, x1: 0.8, y1: 0.5, width: 0.1 });
+    // Normal of a +x segment is (0,1); half-width 0.05 → start/end ±0.05 in y.
+    expect(corners[0]).toEqual({ x: 0.2, y: 0.55 }); // start-left (+normal)
+    expect(corners[1]).toEqual({ x: 0.2, y: 0.45 }); // start-right (-normal)
+    expect(corners[2]).toEqual({ x: 0.8, y: 0.55 }); // end-left
+    expect(corners[3]).toEqual({ x: 0.8, y: 0.45 }); // end-right
+  });
+
+  it("expandLineToQuad offsets a vertical segment along the x normal", () => {
+    const corners = expandLineToQuad({ x0: 0.5, y0: 0.2, x1: 0.5, y1: 0.8, width: 0.2 });
+    // Direction (0,1) → normal (-1,0); half-width 0.1 → ±0.1 in x.
+    expect(corners[0].x).toBeCloseTo(0.4, 6);
+    expect(corners[1].x).toBeCloseTo(0.6, 6);
+    expect(corners[0].y).toBeCloseTo(0.2, 6);
+    expect(corners[2].y).toBeCloseTo(0.8, 6);
+  });
+
+  it("expandLineToQuad falls back to a horizontal normal for a degenerate segment", () => {
+    // Zero-length segment must not produce NaNs; it falls back to dir +x.
+    const corners = expandLineToQuad({ x0: 0.5, y0: 0.5, x1: 0.5, y1: 0.5, width: 0.1 });
+    for (const c of corners) {
+      expect(Number.isFinite(c.x)).toBe(true);
+      expect(Number.isFinite(c.y)).toBe(true);
+    }
+    expect(corners[0]).toEqual({ x: 0.5, y: 0.55 });
+  });
+
+  it("normalizedToClip maps the normalized frame to clip space (y flipped)", () => {
+    expect(normalizedToClip(0, 0)).toEqual({ x: -1, y: 1 }); // top-left
+    expect(normalizedToClip(1, 1)).toEqual({ x: 1, y: -1 }); // bottom-right
+    expect(normalizedToClip(0.5, 0.5)).toEqual({ x: 0, y: 0 }); // center
+  });
+
+  it("lineBoundsRect returns the tight bounds of the stroked quad", () => {
+    const b = lineBoundsRect({ x0: 0.2, y0: 0.5, x1: 0.8, y1: 0.5, width: 0.1 });
+    expect(b.x).toBeCloseTo(0.2, 6);
+    expect(b.y).toBeCloseTo(0.45, 6);
+    expect(b.w).toBeCloseTo(0.6, 6);
+    expect(b.h).toBeCloseTo(0.1, 6);
+  });
+});
+
+describe("rich primitives — WebGPU draws (V2-03)", () => {
+  /** Build a bloom-off renderer + harness ready to draw one frame. */
+  async function makeReady() {
+    const harness = makeWebgpuHarness();
+    const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
+    await renderer.init();
+    renderer.setPostEffects({ bloom: { enabled: false }, vignette: { enabled: false } });
+    renderer.resize(100, 100, 1);
+    return { harness, renderer };
+  }
+
+  it("drawGradientRect records a gradient instance carrying both endpoints", async () => {
+    const { harness, renderer } = await makeReady();
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.drawGradientRect(
+      { x: 0.1, y: 0.2, w: 0.5, h: 0.4, color: { r: 0, g: 0, b: 0, a: 1 } },
+      { from: { r: 1, g: 0, b: 0, a: 1 }, to: { r: 0, g: 0, b: 1, a: 1 }, angle: 0 },
+    );
+    renderer.endFrame();
+
+    const writes = allWrites(harness.writeBuffer);
+    // The instance packs [x,y,w,h, from.rgba, to.rgba, angle, radial, _, _].
+    // Endpoints honored: from=red, to=blue present contiguously in some write.
+    expect(someWriteContainsSeq(writes, [1, 0, 0, 1, 0, 0, 1, 1])).toBe(true);
+    // The rect geometry + linear (radial flag 0) params are present.
+    expect(someWriteContainsSeq(writes, [0.1, 0.2, 0.5, 0.4])).toBe(true);
+    // Scene pass draws the gradient as ONE instanced quad, then post composites.
+    expect(harness.drawsByPass[0]).toEqual([[6, 1]]);
+    expect(harness.drawsByPass[1]).toEqual([[3, 1]]);
+  });
+
+  it("drawGradientRect honors the radial flag", async () => {
+    const { harness, renderer } = await makeReady();
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.drawGradientRect(
+      { x: 0, y: 0, w: 1, h: 1, color: { r: 0, g: 0, b: 0, a: 1 } },
+      { from: { r: 2, g: 2, b: 2, a: 1 }, to: { r: 0, g: 0, b: 0, a: 0 }, radial: true },
+    );
+    renderer.endFrame();
+    const writes = allWrites(harness.writeBuffer);
+    // params lane has radial=1 (the 14th float of the instance: angle=0, radial=1).
+    expect(someWriteContainsSeq(writes, [0, 1, 0, 0])).toBe(true);
+  });
+
+  it("drawGlow records a feathered HDR instance and draws it additively", async () => {
+    const { harness, renderer } = await makeReady();
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    // intensity>1 pushes the core into HDR so bloom can pick it up.
+    renderer.drawGlow({
+      x: 0.5,
+      y: 0.5,
+      radius: 0.2,
+      color: { r: 1, g: 0.8, b: 0.6, a: 1 },
+      intensity: 3,
+    });
+    renderer.endFrame();
+
+    const writes = allWrites(harness.writeBuffer);
+    // Instance: [cx,cy,radius,_, color.rgba, intensity,_,_,_].
+    expect(someWriteContainsSeq(writes, [0.5, 0.5, 0.2, 0])).toBe(true);
+    expect(someWriteContainsSeq(writes, [1, 0.8, 0.6, 1, 3])).toBe(true);
+    // One instanced glow draw in the scene pass.
+    expect(harness.drawsByPass[0]).toEqual([[6, 1]]);
+  });
+
+  it("drawGlow defaults intensity to 1 and skips zero-radius glows", async () => {
+    const { harness, renderer } = await makeReady();
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.drawGlow({ x: 0.5, y: 0.5, radius: 0, color: { r: 1, g: 1, b: 1, a: 1 } }); // skipped
+    renderer.drawGlow({ x: 0.3, y: 0.7, radius: 0.1, color: { r: 1, g: 1, b: 1, a: 1 } }); // intensity → 1
+    renderer.endFrame();
+    const writes = allWrites(harness.writeBuffer);
+    expect(someWriteContainsSeq(writes, [0.3, 0.7, 0.1, 0])).toBe(true);
+    // Exactly ONE glow instance (the zero-radius one was skipped).
+    expect(harness.drawsByPass[0]).toEqual([[6, 1]]);
+  });
+
+  it("drawLine records the four expanded corners and a single instanced draw", async () => {
+    const { harness, renderer } = await makeReady();
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.drawLine({
+      x0: 0.2,
+      y0: 0.5,
+      x1: 0.8,
+      y1: 0.5,
+      width: 0.1,
+      color: { r: 0, g: 1, b: 0, a: 1 },
+    });
+    renderer.endFrame();
+
+    const writes = allWrites(harness.writeBuffer);
+    // Instance packs [c0.xy, c1.xy, c2.xy, c3.xy, color.rgba].
+    // Horizontal line → corners at y 0.55/0.45 (see expandLineToQuad test).
+    expect(someWriteContainsSeq(writes, [0.2, 0.55, 0.2, 0.45, 0.8, 0.55, 0.8, 0.45])).toBe(true);
+    expect(someWriteContainsSeq(writes, [0, 1, 0, 1])).toBe(true); // green color
+    expect(harness.drawsByPass[0]).toEqual([[6, 1]]);
+  });
+
+  it("setBlendMode(additive) selects the additive rect pipeline; default is alpha", async () => {
+    // Two frames from fresh renderers: alpha default vs additive. The additive
+    // frame must bind a DIFFERENT scene pipeline object for the rect batch.
+    const a = await makeReady();
+    a.renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    a.renderer.drawRect({ x: 0, y: 0, w: 0.5, h: 0.5, color: { r: 1, g: 0, b: 0, a: 1 } });
+    a.renderer.endFrame();
+    // First setPipeline call is the scene (rect) pipeline; second is post.
+    const alphaScenePipeline = a.harness.setPipeline.mock.calls[0]?.[0];
+
+    const b = await makeReady();
+    b.renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    b.renderer.setBlendMode("additive");
+    b.renderer.drawRect({ x: 0, y: 0, w: 0.5, h: 0.5, color: { r: 1, g: 0, b: 0, a: 1 } });
+    b.renderer.endFrame();
+    const addScenePipeline = b.harness.setPipeline.mock.calls[0]?.[0];
+
+    // Both are real pipeline objects but distinct identities (alpha vs additive).
+    expect(alphaScenePipeline).toBeDefined();
+    expect(addScenePipeline).toBeDefined();
+    expect(addScenePipeline).not.toBe(alphaScenePipeline);
+  });
+
+  it("coalesces a run of same-kind/blend primitives into ONE instanced draw, preserving order across kinds", async () => {
+    const { harness, renderer } = await makeReady();
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    // 3 rects, then 2 glows, then 1 line — three batches, three scene draws.
+    renderer.drawRect({ x: 0, y: 0, w: 0.2, h: 0.2, color: { r: 1, g: 0, b: 0, a: 1 } });
+    renderer.drawRect({ x: 0.2, y: 0, w: 0.2, h: 0.2, color: { r: 1, g: 0, b: 0, a: 1 } });
+    renderer.drawRect({ x: 0.4, y: 0, w: 0.2, h: 0.2, color: { r: 1, g: 0, b: 0, a: 1 } });
+    renderer.drawGlow({ x: 0.5, y: 0.5, radius: 0.1, color: { r: 1, g: 1, b: 1, a: 1 } });
+    renderer.drawGlow({ x: 0.6, y: 0.6, radius: 0.1, color: { r: 1, g: 1, b: 1, a: 1 } });
+    renderer.drawLine({
+      x0: 0,
+      y0: 0.9,
+      x1: 1,
+      y1: 0.9,
+      width: 0.02,
+      color: { r: 0, g: 0, b: 1, a: 1 },
+    });
+    renderer.endFrame();
+
+    // Scene pass: rect batch draw(6,3), glow batch draw(6,2), line batch draw(6,1).
+    expect(harness.drawsByPass[0]).toEqual([
+      [6, 3],
+      [6, 2],
+      [6, 1],
+    ]);
+    // Post pass composites once.
+    expect(harness.drawsByPass[1]).toEqual([[3, 1]]);
+    // Three scene-primitive pipelines bound + one post = four setPipeline calls.
+    expect(harness.setPipeline).toHaveBeenCalledTimes(4);
+  });
+
+  it("does NOT coalesce across a blend-mode change", async () => {
+    const { harness, renderer } = await makeReady();
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.drawRect({ x: 0, y: 0, w: 0.2, h: 0.2, color: { r: 1, g: 0, b: 0, a: 1 } }); // alpha
+    renderer.setBlendMode("additive");
+    renderer.drawRect({ x: 0.2, y: 0, w: 0.2, h: 0.2, color: { r: 1, g: 0, b: 0, a: 1 } }); // additive
+    renderer.endFrame();
+    // Two separate rect batches → two scene draws (each one instance).
+    expect(harness.drawsByPass[0]).toEqual([
+      [6, 1],
+      [6, 1],
+    ]);
+  });
+
+  it("all primitives are part of the backend-agnostic surface (no backend branch)", () => {
+    const drive = (r: Renderer): void => {
+      r.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+      r.setBlendMode("additive");
+      r.drawGradientRect(
+        { x: 0, y: 0, w: 1, h: 1, color: { r: 0, g: 0, b: 0, a: 1 } },
+        { from: { r: 1, g: 0, b: 0, a: 1 }, to: { r: 0, g: 0, b: 1, a: 1 } },
+      );
+      r.drawGlow({ x: 0.5, y: 0.5, radius: 0.2, color: { r: 1, g: 1, b: 1, a: 1 }, intensity: 2 });
+      r.drawLine({ x0: 0, y0: 0, x1: 1, y1: 1, width: 0.01, color: { r: 1, g: 1, b: 1, a: 1 } });
+      r.endFrame();
+    };
+    const src = drive.toString();
+    expect(src).not.toMatch(/webgpu|webgl|GPUDevice|WebGLRenderingContext|getContext|gl\./i);
+    expect(src).not.toMatch(/\.backend/);
+  });
+});
+
+describe("rich primitives — WebGL approximations (V2-03)", () => {
+  it("drawGlow always blends additively (light) regardless of blend mode", async () => {
+    const { canvas, gl } = makeFakeCanvas();
+    const renderer = createRenderer(canvas, { environment: { gpu: null, hasWebgl: () => true } });
+    await renderer.init();
+    renderer.resize(100, 100, 1);
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.drawGlow({
+      x: 0.5,
+      y: 0.5,
+      radius: 0.2,
+      color: { r: 1, g: 1, b: 1, a: 1 },
+      intensity: 2,
+    });
+    renderer.endFrame();
+    // The glow's quads use additive blend (SRC_ALPHA, ONE).
+    expect(gl.blendFunc).toHaveBeenCalledWith(gl.SRC_ALPHA, gl.ONE);
+    // Two stacked quads (halo + core) approximate the feathered blob.
+    expect(gl.drawArrays).toHaveBeenCalledTimes(2);
+  });
+
+  it("drawGradientRect approximates a linear ramp with banded solid rects", async () => {
+    const { canvas, gl } = makeFakeCanvas();
+    const renderer = createRenderer(canvas, { environment: { gpu: null, hasWebgl: () => true } });
+    await renderer.init();
+    renderer.resize(100, 100, 1);
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.drawGradientRect(
+      { x: 0, y: 0, w: 1, h: 1, color: { r: 0, g: 0, b: 0, a: 1 } },
+      { from: { r: 1, g: 0, b: 0, a: 1 }, to: { r: 0, g: 0, b: 1, a: 1 }, angle: 0 },
+    );
+    renderer.endFrame();
+    // Several banded quads (the stepped ramp) → multiple draws, endpoints present.
+    expect(gl.drawArrays.mock.calls.length).toBeGreaterThan(1);
+    expect(gl.uniform4f).toHaveBeenCalledWith({ name: "u_color" }, 1, 0, 0, 1); // from
+    expect(gl.uniform4f).toHaveBeenCalledWith({ name: "u_color" }, 0, 0, 1, 1); // to
+  });
+
+  it("drawLine approximates with a thin rect and respects additive blend", async () => {
+    const { canvas, gl } = makeFakeCanvas();
+    const renderer = createRenderer(canvas, { environment: { gpu: null, hasWebgl: () => true } });
+    await renderer.init();
+    renderer.resize(100, 100, 1);
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.setBlendMode("additive");
+    renderer.drawLine({
+      x0: 0.2,
+      y0: 0.5,
+      x1: 0.8,
+      y1: 0.5,
+      width: 0.1,
+      color: { r: 0, g: 1, b: 0, a: 1 },
+    });
+    renderer.endFrame();
+    // Thin-rect bounds: x=0.2, y=0.45, w=0.6, h=0.1.
+    expect(gl.uniform4f).toHaveBeenCalledWith(
+      { name: "u_rect" },
+      0.2,
+      expect.closeTo(0.45, 5),
+      expect.closeTo(0.6, 5),
+      expect.closeTo(0.1, 5),
+    );
+    expect(gl.blendFunc).toHaveBeenLastCalledWith(gl.SRC_ALPHA, gl.ONE);
+  });
+
+  it("never throws on the new primitives (the basic backend always runs presets)", async () => {
+    const { canvas } = makeFakeCanvas();
+    const renderer = createRenderer(canvas, { environment: { gpu: null, hasWebgl: () => true } });
+    await renderer.init();
+    renderer.resize(100, 100, 1);
+    expect(() => {
+      renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+      renderer.setBlendMode("additive");
+      renderer.drawGradientRect(
+        { x: 0, y: 0, w: 1, h: 1, color: { r: 0, g: 0, b: 0, a: 1 } },
+        { from: { r: 1, g: 0, b: 0, a: 1 }, to: { r: 0, g: 0, b: 1, a: 1 }, radial: true },
+      );
+      renderer.drawGlow({ x: 0.5, y: 0.5, radius: 0.2, color: { r: 1, g: 1, b: 1, a: 1 } });
+      renderer.drawLine({
+        x0: 0,
+        y0: 0,
+        x1: 1,
+        y1: 1,
+        width: 0.01,
+        color: { r: 1, g: 1, b: 1, a: 1 },
+      });
+      renderer.endFrame();
+    }).not.toThrow();
   });
 });
