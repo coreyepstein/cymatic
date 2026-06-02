@@ -69,6 +69,26 @@ export interface DrawingBufferSize {
 }
 
 /**
+ * An axis-aligned rectangle expressed in normalized device coordinates: the
+ * frame spans `x: [0, 1]` (left→right) and `y: [0, 1]` (top→bottom), so the
+ * surface is resolution-independent and presets never deal in pixels. `w`/`h`
+ * are normalized extents. This is the one backend-agnostic shape primitive the
+ * Renderer understands; richer geometry composes from it.
+ */
+export interface NormalizedRect {
+  /** Left edge, normalized `[0, 1]`. */
+  x: number;
+  /** Top edge, normalized `[0, 1]`. */
+  y: number;
+  /** Width, normalized `[0, 1]`. */
+  w: number;
+  /** Height, normalized `[0, 1]`. */
+  h: number;
+  /** Fill color. */
+  color: RgbaColor;
+}
+
+/**
  * The backend-agnostic renderer. One instance owns a canvas's drawing context,
  * the backing-store sizing, and per-frame submission. Presets only ever see
  * this surface.
@@ -96,8 +116,31 @@ export interface Renderer {
   /**
    * Render one frame of `scene`, modulated by `features`, at time `timeSeconds`.
    * For the smoke scene this clears the frame to `scene.background`.
+   *
+   * This remains the simplest entry point (a solid fill). Presets that need to
+   * draw primitives use the imperative frame API below
+   * ({@link beginFrame}/{@link drawRect}/{@link endFrame}) instead.
    */
   render(scene: Scene, features: RenderFeatures, timeSeconds: number): void;
+
+  /**
+   * Open a frame, clearing the backing store to `background`. Pairs with
+   * {@link endFrame}. Between the two, issue draw primitives like
+   * {@link drawRect}. Backend-agnostic: presets never see the underlying pass /
+   * GL state this sets up.
+   */
+  beginFrame(background: RgbaColor): void;
+
+  /**
+   * Draw a filled, axis-aligned rectangle in normalized device coordinates.
+   * Must be called between {@link beginFrame} and {@link endFrame}. This is the
+   * single shape primitive every backend implements; geometric / color-field /
+   * particle preset packs compose their output from many of these.
+   */
+  drawRect(rect: NormalizedRect): void;
+
+  /** Close the frame opened by {@link beginFrame}, submitting all draws. */
+  endFrame(): void;
 
   /** Release GPU/GL resources. Idempotent. */
   dispose(): void;

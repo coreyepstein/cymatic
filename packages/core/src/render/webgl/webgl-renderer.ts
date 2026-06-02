@@ -11,8 +11,10 @@ import type { RendererBackend } from "../capabilities.js";
 import {
   computeDrawingBufferSize,
   type DrawingBufferSize,
+  type NormalizedRect,
   type RenderFeatures,
   type Renderer,
+  type RgbaColor,
   type Scene,
 } from "../renderer.js";
 
@@ -32,9 +34,13 @@ export interface WebglRendererOptions {
 /** Structural subset of `WebGLRenderingContext` this renderer uses. */
 interface GlLike {
   readonly COLOR_BUFFER_BIT: number;
+  readonly SCISSOR_TEST: number;
   viewport(x: number, y: number, width: number, height: number): void;
   clearColor(r: number, g: number, b: number, a: number): void;
   clear(mask: number): void;
+  enable(cap: number): void;
+  disable(cap: number): void;
+  scissor(x: number, y: number, width: number, height: number): void;
 }
 
 export class WebglRenderer implements Renderer {
@@ -73,13 +79,48 @@ export class WebglRenderer implements Renderer {
   }
 
   render(scene: Scene, _features: RenderFeatures, _timeSeconds: number): void {
-    const gl = this.gl;
-    if (!gl) {
-      throw new Error("WebglRenderer: render() called before init().");
-    }
-    const { r, g, b, a } = scene.background;
+    this.beginFrame(scene.background);
+    this.endFrame();
+  }
+
+  beginFrame(background: RgbaColor): void {
+    const gl = this.requireGl("beginFrame");
+    gl.disable(gl.SCISSOR_TEST);
+    gl.clearColor(background.r, background.g, background.b, background.a);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+
+  drawRect(rect: NormalizedRect): void {
+    const gl = this.requireGl("drawRect");
+    // Filled rect via a scissored clear — a real, shader-free GL technique.
+    // Normalized coords have y running top→bottom; GL's framebuffer origin is
+    // bottom-left, so flip y when mapping to device pixels.
+    const { width, height } = this.size;
+    const px = Math.round(rect.x * width);
+    const pw = Math.round(rect.w * width);
+    const ph = Math.round(rect.h * height);
+    const py = Math.round((1 - rect.y - rect.h) * height);
+    if (pw <= 0 || ph <= 0) return;
+
+    gl.enable(gl.SCISSOR_TEST);
+    gl.scissor(px, py, pw, ph);
+    const { r, g, b, a } = rect.color;
     gl.clearColor(r, g, b, a);
     gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+
+  endFrame(): void {
+    const gl = this.gl;
+    // Leave scissor disabled so it can't leak into the next frame's clear.
+    gl?.disable(gl.SCISSOR_TEST);
+  }
+
+  private requireGl(op: string): GlLike {
+    const gl = this.gl;
+    if (!gl) {
+      throw new Error(`WebglRenderer: ${op}() called before init().`);
+    }
+    return gl;
   }
 
   dispose(): void {

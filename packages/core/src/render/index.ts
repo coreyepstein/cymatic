@@ -21,6 +21,7 @@ export type {
   Scene,
   RenderFeatures,
   RgbaColor,
+  NormalizedRect,
   DrawingBufferSize,
   RenderCanvasLike,
   CreateRendererOptions,

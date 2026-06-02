@@ -25,3 +25,13 @@ export * from "./clock/index.js";
 // via capability detection. Presets target the Renderer and never branch on the
 // backend.
 export * from "./render/index.js";
+
+// Visual primitives (US-005): easing & smoothing, color & palettes,
+// lightweight typography, and audio-feature bindings — the pure, backend-
+// agnostic building blocks presets compose from.
+export * from "./primitives/index.js";
+
+// Preset & layer/pass API (US-005): the Preset contract, definePreset, a
+// PresetRegistry, the layer composition model, and a reference example preset
+// built only from the public primitive surface.
+export * from "./preset/index.js";

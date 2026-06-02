@@ -7,6 +7,7 @@ import {
   toRgba,
   type RenderCanvasLike,
   type Renderer,
+  type RgbaColor,
   type Scene,
 } from "./renderer.js";
 
@@ -55,9 +56,13 @@ function makeFakeCanvas() {
   const contexts: string[] = [];
   const gl = {
     COLOR_BUFFER_BIT: 0x4000,
+    SCISSOR_TEST: 0x0c11,
     viewport: vi.fn(),
     clearColor: vi.fn(),
     clear: vi.fn(),
+    enable: vi.fn(),
+    disable: vi.fn(),
+    scissor: vi.fn(),
   };
   const canvas: RenderCanvasLike = {
     width: 0,
@@ -177,5 +182,91 @@ describe("preset-facing call path is backend-agnostic", () => {
       colorAttachments: Array<{ clearValue: { r: number; g: number; b: number; a: number } }>;
     };
     expect(desc.colorAttachments[0]?.clearValue).toEqual({ r: 0.1, g: 0.2, b: 0.3, a: 1 });
+  });
+});
+
+describe("drawRect primitive (backend-agnostic)", () => {
+  it("webgl draws a rect via a scissored clear in device pixels", async () => {
+    const { canvas, gl } = makeFakeCanvas();
+    const renderer = createRenderer(canvas, {
+      environment: { gpu: null, hasWebgl: () => true },
+    });
+    await renderer.init();
+    renderer.resize(100, 100, 2); // backing store 200x200
+
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    // A rect at the top-left quarter; y is flipped for GL's bottom-left origin.
+    renderer.drawRect({ x: 0, y: 0, w: 0.5, h: 0.5, color: { r: 1, g: 0, b: 0, a: 1 } });
+    renderer.endFrame();
+
+    expect(gl.enable).toHaveBeenCalledWith(gl.SCISSOR_TEST);
+    // device px: x=0, w=100, h=100, y = (1 - 0 - 0.5)*200 = 100
+    expect(gl.scissor).toHaveBeenCalledWith(0, 100, 100, 100);
+    expect(gl.clearColor).toHaveBeenLastCalledWith(1, 0, 0, 1);
+    // Scissor is disabled again at endFrame so it can't leak.
+    expect(gl.disable).toHaveBeenLastCalledWith(gl.SCISSOR_TEST);
+  });
+
+  it("webgl skips zero-area rects", async () => {
+    const { canvas, gl } = makeFakeCanvas();
+    const renderer = createRenderer(canvas, {
+      environment: { gpu: null, hasWebgl: () => true },
+    });
+    await renderer.init();
+    renderer.resize(100, 100, 1);
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    gl.scissor.mockClear();
+    renderer.drawRect({ x: 0, y: 0, w: 0, h: 0.5, color: { r: 1, g: 1, b: 1, a: 1 } });
+    renderer.endFrame();
+    expect(gl.scissor).not.toHaveBeenCalled();
+  });
+
+  it("webgpu draws a rect via a scissored load-pass", async () => {
+    const submit = vi.fn();
+    const scissorCalls: number[][] = [];
+    const passDescriptors: unknown[] = [];
+    const device = {
+      createCommandEncoder: () => ({
+        beginRenderPass: (d: unknown) => {
+          passDescriptors.push(d);
+          return {
+            setScissorRect: (x: number, y: number, w: number, h: number) =>
+              scissorCalls.push([x, y, w, h]),
+            end: vi.fn(),
+          };
+        },
+        finish: () => ({}),
+      }),
+      queue: { submit },
+    };
+    const gpuCtx = {
+      configure: vi.fn(),
+      getCurrentTexture: () => ({ createView: () => ({}) }),
+    };
+    const canvas: RenderCanvasLike = {
+      width: 0,
+      height: 0,
+      getContext: (id: string) => (id === "webgpu" ? gpuCtx : null),
+    };
+    const gpu = {
+      requestAdapter: () => Promise.resolve({ requestDevice: () => Promise.resolve(device) }),
+      getPreferredCanvasFormat: () => "bgra8unorm",
+    };
+    const renderer = createRenderer(canvas, { backend: "webgpu", gpu });
+    await renderer.init();
+    renderer.resize(100, 100, 2); // 200x200
+
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.drawRect({ x: 0.25, y: 0.25, w: 0.5, h: 0.5, color: { r: 1, g: 0, b: 0, a: 1 } });
+    renderer.endFrame();
+
+    // device px: x=50, y=50, w=100, h=100
+    expect(scissorCalls).toEqual([[50, 50, 100, 100]]);
+    // The rect pass clears just its region to the fill color.
+    const rectPass = passDescriptors[1] as {
+      colorAttachments: Array<{ clearValue: RgbaColor; loadOp: string }>;
+    };
+    expect(rectPass.colorAttachments[0]?.clearValue).toEqual({ r: 1, g: 0, b: 0, a: 1 });
+    expect(submit).toHaveBeenCalledTimes(1);
   });
 });
