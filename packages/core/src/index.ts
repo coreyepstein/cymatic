@@ -10,3 +10,7 @@ export const version = "0.0.0";
 
 /** Identifier for the core package. */
 export const name = "@cymatic/core";
+
+// Audio analysis engine (US-002): FFT bands, RMS/loudness, onset detection,
+// and input adapters for <audio>, microphone, and decoded AudioBuffer.
+export * from "./audio/index.js";
