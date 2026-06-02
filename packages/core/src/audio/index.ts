@@ -30,3 +30,9 @@ export { connectMicrophoneSource } from "./inputs/microphone.js";
 
 export type { BufferSource } from "./inputs/buffer.js";
 export { decodeAudioData, playBufferSource } from "./inputs/buffer.js";
+
+export type {
+  AudioBufferLike,
+  OfflineSamplerOptions,
+} from "./offline-sampler.js";
+export { OfflineSampler } from "./offline-sampler.js";

@@ -12,5 +12,10 @@ export const version = "0.0.0";
 export const name = "@cymatic/core";
 
 // Audio analysis engine (US-002): FFT bands, RMS/loudness, onset detection,
-// and input adapters for <audio>, microphone, and decoded AudioBuffer.
+// and input adapters for <audio>, microphone, and decoded AudioBuffer. Also
+// exposes the offline AudioBuffer feature sampler (US-003).
 export * from "./audio/index.js";
+
+// Timing / clock abstraction (US-003): a single Clock interface backing both a
+// realtime (rAF, wall-clock) and an offline (fixed 1/fps, deterministic) driver.
+export * from "./clock/index.js";

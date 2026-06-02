@@ -86,6 +86,18 @@ export class AudioAnalyser {
     return this.opts.bandCount;
   }
 
+  /**
+   * Reset all running state — smoothed bands, smoothed RMS, and the onset
+   * detector — to the just-constructed condition. Useful for offline rendering
+   * so a sequence can be reproduced deterministically from frame 0 without
+   * re-attaching to a node.
+   */
+  reset(): void {
+    this.smoothedBands = new Array<number>(this.opts.bandCount).fill(0);
+    this.smoothedRms = 0;
+    this.beatDetector.reset();
+  }
+
   /** The underlying `AnalyserNode`, or `null` until {@link attach} is called. */
   get analyserNode(): AnalyserNode | null {
     return this.node;
