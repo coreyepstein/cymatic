@@ -72,6 +72,28 @@ export interface DrawingBufferSize {
 }
 
 /**
+ * Backend-agnostic configuration for the post-processing chain.
+ *
+ * This is the single knob preset/React code uses to drive cinematic effects;
+ * it NEVER branches on the concrete backend. The WebGPU backend honours these
+ * fields by routing the scene through an offscreen HDR target and a chain of
+ * fullscreen passes; the WebGL backend treats this as a no-op (basic look).
+ *
+ * The shape is intentionally open for extension: later cinematic stories add
+ * `bloom`, `vignette`, `trails`, etc. as further optional fields without
+ * changing this method's contract. All fields are optional so a partial config
+ * merges onto the renderer's current state — only the keys present are updated.
+ */
+export interface PostEffectsConfig {
+  /**
+   * Exposure multiplier applied before tonemapping in the final composite
+   * stage. `1.0` is neutral; higher values brighten, lower darken. Clamped to
+   * a non-negative finite value by the backend.
+   */
+  exposure?: number;
+}
+
+/**
  * An axis-aligned rectangle expressed in normalized device coordinates: the
  * frame spans `x: [0, 1]` (left→right) and `y: [0, 1]` (top→bottom), so the
  * surface is resolution-independent and presets never deal in pixels. `w`/`h`
@@ -144,6 +166,17 @@ export interface Renderer {
 
   /** Close the frame opened by {@link beginFrame}, submitting all draws. */
   endFrame(): void;
+
+  /**
+   * Configure the post-processing chain. Backend-agnostic: presets/React call
+   * this without ever inspecting {@link backend}. Fields present in `config`
+   * update the renderer's post-FX state; omitted fields are left unchanged.
+   *
+   * WebGPU routes the scene through an offscreen HDR target and applies the
+   * configured stages (tonemap + exposure today, more later). WebGL implements
+   * this as a no-op and keeps its direct-render basic look.
+   */
+  setPostEffects(config: PostEffectsConfig): void;
 
   /** Release GPU/GL resources. Idempotent. */
   dispose(): void;

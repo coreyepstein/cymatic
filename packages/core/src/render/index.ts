@@ -25,6 +25,7 @@ export type {
   DrawingBufferSize,
   RenderCanvasLike,
   CreateRendererOptions,
+  PostEffectsConfig,
 } from "./renderer.js";
 export { createRenderer, computeDrawingBufferSize, toRgba } from "./renderer.js";
 

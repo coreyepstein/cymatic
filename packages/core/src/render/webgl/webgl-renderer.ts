@@ -12,6 +12,7 @@ import {
   computeDrawingBufferSize,
   type DrawingBufferSize,
   type NormalizedRect,
+  type PostEffectsConfig,
   type RenderFeatures,
   type Renderer,
   type RgbaColor,
@@ -113,6 +114,16 @@ export class WebglRenderer implements Renderer {
     const gl = this.gl;
     // Leave scissor disabled so it can't leak into the next frame's clear.
     gl?.disable(gl.SCISSOR_TEST);
+  }
+
+  /**
+   * No-op for the WebGL backend. Cinematic post-processing (HDR offscreen
+   * target, tonemap/exposure, bloom, …) is WebGPU-only; WebGL keeps its basic
+   * direct-render look. Accepting and ignoring the config keeps the
+   * preset/React call site backend-agnostic — callers never branch.
+   */
+  setPostEffects(_config: PostEffectsConfig): void {
+    // intentionally no-op
   }
 
   private requireGl(op: string): GlLike {

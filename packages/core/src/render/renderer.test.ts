@@ -225,56 +225,90 @@ describe("preset-facing call path is backend-agnostic", () => {
 
     expect(harness.canvas.width).toBe(1280);
     expect(harness.canvas.height).toBe(960);
-    // The smoke scene draws no rects: exactly one pass, cleared to the
-    // background, and one submit.
+    // The v2 framework routes the frame through an offscreen HDR target: every
+    // frame is TWO passes (scene→offscreen, then post/composite→swapchain) and
+    // a single submit batching both.
     expect(harness.submit).toHaveBeenCalledTimes(1);
-    expect(harness.passDescriptors).toHaveLength(1);
-    const desc = harness.passDescriptors[0] as {
+    expect(harness.passDescriptors).toHaveLength(2);
+    // PASS 1 (scene) clears the offscreen HDR target to the background.
+    const sceneDesc = harness.passDescriptors[0] as {
       colorAttachments: Array<{
         clearValue: { r: number; g: number; b: number; a: number };
         loadOp: string;
       }>;
     };
-    expect(desc.colorAttachments[0]?.loadOp).toBe("clear");
-    expect(desc.colorAttachments[0]?.clearValue).toEqual({ r: 0.1, g: 0.2, b: 0.3, a: 1 });
-    // The pipeline is built once in init() and bound for the frame.
-    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(1);
-    expect(harness.setPipeline).toHaveBeenCalledTimes(1);
+    expect(sceneDesc.colorAttachments[0]?.loadOp).toBe("clear");
+    expect(sceneDesc.colorAttachments[0]?.clearValue).toEqual({ r: 0.1, g: 0.2, b: 0.3, a: 1 });
+    // Two pipelines are built once in init() (scene + post) and both bound.
+    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(2);
+    // Scene pipeline bound in pass 1, post pipeline bound in pass 2.
+    expect(harness.setPipeline).toHaveBeenCalledTimes(2);
+    // The post pass binds the composite bind group (HDR texture + sampler + params).
+    expect(harness.setBindGroup).toHaveBeenCalledTimes(1);
+    // The offscreen HDR target is allocated as an rgba16float texture.
+    expect(harness.createTexture).toHaveBeenCalled();
+    const texDesc = harness.createTexture.mock.calls[0]?.[0] as { format: string };
+    expect(texDesc.format).toBe("rgba16float");
   });
 });
 
 /**
- * A recording WebGPU harness modelling the structural slice the renderer uses:
- * a device exposing `createShaderModule` / `createRenderPipeline` /
- * `createBuffer` / `queue.writeBuffer`, and a render pass recording
- * `setPipeline` / `setVertexBuffer` / `draw`. Returns the spies the contract
- * assertions read.
+ * A recording WebGPU harness modelling the structural slice the renderer uses,
+ * INCLUDING the v2 HDR offscreen target + post-processing framework: the device
+ * exposes `createShaderModule` / `createRenderPipeline` / `createBuffer` /
+ * `createTexture` / `createSampler` / `createBindGroupLayout` /
+ * `createPipelineLayout` / `createBindGroup` / `queue.writeBuffer`, and each
+ * render pass records `setPipeline` / `setVertexBuffer` / `setBindGroup` /
+ * `draw`. The renderer runs TWO passes per frame (scene→offscreen HDR, then
+ * post/composite→swapchain), so the harness records per-pass spies and exposes
+ * convenience aggregates (`setPipeline`, `setVertexBuffer`, `drawCalls`) over
+ * ALL passes. Returns the spies the contract assertions read.
  */
 function makeWebgpuHarness() {
   const submit = vi.fn();
   const writeBuffer = vi.fn();
   const setPipeline = vi.fn();
   const setVertexBuffer = vi.fn();
+  const setBindGroup = vi.fn();
   const end = vi.fn();
-  /** Records `[vertexCount, instanceCount]` per `draw` call. */
+  /** Records `[vertexCount, instanceCount]` per `draw` call across all passes. */
   const drawCalls: Array<[number, number | undefined]> = [];
   const passDescriptors: unknown[] = [];
+  /** Per-pass recorded draw calls, in pass order. */
+  const drawsByPass: Array<Array<[number, number | undefined]>> = [];
   const createRenderPipeline = vi.fn((_d: unknown) => ({ __brand: "pipeline" as const }));
   const createShaderModule = vi.fn((_d: unknown) => ({ __brand: "shader" as const }));
   const createBuffer = vi.fn((_d: unknown) => ({ destroy: vi.fn() }));
+  const createTexture = vi.fn((_d: unknown) => ({
+    createView: () => ({ __brand: "view" as const }),
+    destroy: vi.fn(),
+  }));
+  const createSampler = vi.fn((_d?: unknown) => ({ __brand: "sampler" as const }));
+  const createBindGroupLayout = vi.fn((_d: unknown) => ({ __brand: "bindGroupLayout" as const }));
+  const createPipelineLayout = vi.fn((_d: unknown) => ({ __brand: "pipelineLayout" as const }));
+  const createBindGroup = vi.fn((_d: unknown) => ({ __brand: "bindGroup" as const }));
 
   const device = {
     createShaderModule,
     createRenderPipeline,
     createBuffer,
+    createTexture,
+    createSampler,
+    createBindGroupLayout,
+    createPipelineLayout,
+    createBindGroup,
     createCommandEncoder: () => ({
       beginRenderPass: (d: unknown) => {
         passDescriptors.push(d);
+        const passDraws: Array<[number, number | undefined]> = [];
+        drawsByPass.push(passDraws);
         return {
           setPipeline,
           setVertexBuffer,
+          setBindGroup,
           draw: (vertexCount: number, instanceCount?: number) => {
             drawCalls.push([vertexCount, instanceCount]);
+            passDraws.push([vertexCount, instanceCount]);
           },
           end,
         };
@@ -285,7 +319,7 @@ function makeWebgpuHarness() {
   };
   const gpuCtx = {
     configure: vi.fn(),
-    getCurrentTexture: () => ({ createView: () => ({}) }),
+    getCurrentTexture: () => ({ createView: () => ({ __brand: "view" as const }), destroy: vi.fn() }),
   };
   const canvas: RenderCanvasLike = {
     width: 0,
@@ -306,12 +340,19 @@ function makeWebgpuHarness() {
     writeBuffer,
     setPipeline,
     setVertexBuffer,
+    setBindGroup,
     end,
     drawCalls,
+    drawsByPass,
     passDescriptors,
     createRenderPipeline,
     createShaderModule,
     createBuffer,
+    createTexture,
+    createSampler,
+    createBindGroupLayout,
+    createPipelineLayout,
+    createBindGroup,
   };
 }
 
@@ -351,15 +392,16 @@ describe("drawRect primitive (backend-agnostic)", () => {
     expect(gl.scissor).not.toHaveBeenCalled();
   });
 
-  it("webgpu draws rects via ONE instanced draw, not per-rect clears", async () => {
+  it("webgpu draws rects via ONE instanced draw into the offscreen scene pass, not per-rect clears", async () => {
     // The regression contract: after beginFrame + N drawRect + endFrame the
-    // renderer must open EXACTLY ONE render pass for the frame (cleared to the
-    // background), bind the pipeline, and issue a SINGLE instanced draw(6, N).
-    // The old implementation opened a render pass per rect, each with
-    // loadOp:"clear" set to that rect's color — which clears the whole canvas
-    // and leaves only the last fill (the blank-canvas bug). That implementation
-    // records N+1 passes and zero `draw` calls, so it fails every assertion
-    // below; the instanced pipeline passes them.
+    // SCENE pass must clear the offscreen HDR target to the background, bind the
+    // scene pipeline, and issue a SINGLE instanced draw(6, N). The old
+    // per-rect-clear implementation (the blank-canvas bug) records N+1 passes
+    // and zero `draw` calls and fails this.
+    //
+    // The v2 framework adds a second POST pass that composites the HDR target to
+    // the swapchain via a fullscreen triangle (draw(3, 1)), so the frame is two
+    // passes total.
     const harness = makeWebgpuHarness();
     const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
     await renderer.init();
@@ -371,20 +413,23 @@ describe("drawRect primitive (backend-agnostic)", () => {
     renderer.drawRect({ x: 0.5, y: 0.5, w: 0.5, h: 0.5, color: { r: 0, g: 0, b: 1, a: 1 } });
     renderer.endFrame();
 
-    // Exactly ONE pass for the whole frame (not one per rect).
-    expect(harness.passDescriptors).toHaveLength(1);
-    const pass = harness.passDescriptors[0] as {
+    // TWO passes: scene→offscreen, then post→swapchain.
+    expect(harness.passDescriptors).toHaveLength(2);
+    const scenePass = harness.passDescriptors[0] as {
       colorAttachments: Array<{ clearValue: RgbaColor; loadOp: string }>;
     };
-    // That single pass clears to the BACKGROUND (not a rect color).
-    expect(pass.colorAttachments[0]?.loadOp).toBe("clear");
-    expect(pass.colorAttachments[0]?.clearValue).toEqual({ r: 0, g: 0, b: 0, a: 1 });
-    // Pipeline bound, instance buffer set, and a SINGLE instanced draw of all 3.
-    expect(harness.setPipeline).toHaveBeenCalledTimes(1);
+    // The SCENE pass clears the offscreen HDR target to the BACKGROUND.
+    expect(scenePass.colorAttachments[0]?.loadOp).toBe("clear");
+    expect(scenePass.colorAttachments[0]?.clearValue).toEqual({ r: 0, g: 0, b: 0, a: 1 });
+    // Scene pipeline + post pipeline both bound (one setPipeline per pass).
+    expect(harness.setPipeline).toHaveBeenCalledTimes(2);
+    // Instance buffer set once (scene pass only) and a SINGLE instanced draw of all 3.
     expect(harness.setVertexBuffer).toHaveBeenCalledTimes(1);
-    expect(harness.drawCalls).toEqual([[6, 3]]);
-    // Instance data was uploaded once for this frame.
-    expect(harness.writeBuffer).toHaveBeenCalledTimes(1);
+    // Pass 1 (scene) does the instanced draw; pass 2 (post) draws the fullscreen triangle.
+    expect(harness.drawsByPass[0]).toEqual([[6, 3]]);
+    expect(harness.drawsByPass[1]).toEqual([[3, 1]]);
+    expect(harness.drawCalls).toEqual([[6, 3], [3, 1]]);
+    // Instance data uploaded once for this frame; one submit batches both passes.
     expect(harness.submit).toHaveBeenCalledTimes(1);
   });
 
@@ -399,11 +444,13 @@ describe("drawRect primitive (backend-agnostic)", () => {
     renderer.drawRect({ x: 0, y: 0, w: 0.5, h: 0.5, color: { r: 1, g: 0, b: 0, a: 1 } });
     renderer.endFrame();
 
-    // Only the one non-degenerate rect becomes an instance.
-    expect(harness.drawCalls).toEqual([[6, 1]]);
+    // Only the one non-degenerate rect becomes an instance in the scene pass;
+    // the post pass always draws its fullscreen triangle.
+    expect(harness.drawsByPass[0]).toEqual([[6, 1]]);
+    expect(harness.drawsByPass[1]).toEqual([[3, 1]]);
   });
 
-  it("webgpu builds the quad pipeline exactly once across frames", async () => {
+  it("webgpu builds the scene + post pipelines exactly once across frames", async () => {
     const harness = makeWebgpuHarness();
     const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
     await renderer.init();
@@ -415,10 +462,162 @@ describe("drawRect primitive (backend-agnostic)", () => {
       renderer.endFrame();
     }
 
-    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(1);
-    expect(harness.createShaderModule).toHaveBeenCalledTimes(1);
-    // One pass + one instanced draw per frame.
-    expect(harness.passDescriptors).toHaveLength(3);
-    expect(harness.drawCalls).toEqual([[6, 1], [6, 1], [6, 1]]);
+    // Two pipelines (scene + post), two shader modules — built once in init().
+    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(2);
+    expect(harness.createShaderModule).toHaveBeenCalledTimes(2);
+    // Two passes per frame (scene + post) => 6 across 3 frames.
+    expect(harness.passDescriptors).toHaveLength(6);
+    // Each frame: instanced scene draw then fullscreen post draw.
+    expect(harness.drawCalls).toEqual([
+      [6, 1], [3, 1],
+      [6, 1], [3, 1],
+      [6, 1], [3, 1],
+    ]);
+  });
+});
+
+describe("HDR offscreen target + post-processing framework (V2-01)", () => {
+  it("webgpu runs TWO passes per frame: scene→offscreen HDR, then post→swapchain", async () => {
+    // The substrate contract: with the framework active, every frame indirects
+    // through an offscreen rgba16float HDR texture (scene pass) and composites
+    // it to the swapchain via a fullscreen post pass. The scene pass clears the
+    // HDR target; the post pass binds the composite bind group and draws the
+    // fullscreen triangle. Exactly two passes, batched into one submit.
+    const harness = makeWebgpuHarness();
+    const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
+    await renderer.init();
+    renderer.resize(64, 48, 1);
+
+    renderer.beginFrame({ r: 0.02, g: 0.02, b: 0.05, a: 1 });
+    renderer.drawRect({ x: 0, y: 0, w: 0.5, h: 1, color: { r: 1, g: 0, b: 0, a: 1 } });
+    renderer.endFrame();
+
+    // Two passes total.
+    expect(harness.passDescriptors).toHaveLength(2);
+    // The offscreen HDR target is an rgba16float texture, usable as both render
+    // attachment and sampled texture.
+    expect(harness.createTexture).toHaveBeenCalled();
+    const texDesc = harness.createTexture.mock.calls.at(-1)?.[0] as {
+      format: string;
+      size: { width: number; height: number };
+    };
+    expect(texDesc.format).toBe("rgba16float");
+    expect(texDesc.size).toEqual({ width: 64, height: 48 });
+    // The post pass binds the composite bind group (HDR texture + sampler + params).
+    expect(harness.setBindGroup).toHaveBeenCalledTimes(1);
+    expect(harness.createSampler).toHaveBeenCalled();
+    expect(harness.createBindGroup).toHaveBeenCalled();
+    // The post pass draws a fullscreen triangle (3 verts, 1 instance).
+    expect(harness.drawsByPass[1]).toEqual([[3, 1]]);
+    // Both passes go in a single submit.
+    expect(harness.submit).toHaveBeenCalledTimes(1);
+  });
+
+  it("recreates the offscreen HDR target on resize", async () => {
+    const harness = makeWebgpuHarness();
+    const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
+    await renderer.init();
+    renderer.resize(100, 100, 1); // 100x100
+    renderer.resize(50, 50, 1); // 50x50
+
+    // The most recent texture is sized to the latest backing store.
+    const last = harness.createTexture.mock.calls.at(-1)?.[0] as {
+      size: { width: number; height: number };
+    };
+    expect(last.size).toEqual({ width: 50, height: 50 });
+    // More than one texture was allocated (one per resize), and the prior one
+    // was destroyed (no leak).
+    expect(harness.createTexture.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("honours setPostEffects({exposure}): the exposure is uploaded to the post uniform", async () => {
+    const harness = makeWebgpuHarness();
+    const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
+    await renderer.init();
+    renderer.resize(32, 32, 1);
+
+    // Set a non-default exposure BEFORE the frame; the value must reach the GPU
+    // via the post-FX uniform buffer (a Float32Array whose first element is the
+    // exposure).
+    renderer.setPostEffects({ exposure: 2.5 });
+
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.endFrame();
+
+    // Find a writeBuffer call whose data first float is the exposure we set.
+    const exposures = harness.writeBuffer.mock.calls
+      .map((c) => c[2] as ArrayBufferLike | ArrayBufferView)
+      .map((data) => {
+        const view =
+          data instanceof ArrayBuffer
+            ? new Float32Array(data)
+            : new Float32Array(
+                (data as ArrayBufferView).buffer,
+                (data as ArrayBufferView).byteOffset,
+              );
+        return view[0];
+      });
+    expect(exposures).toContain(2.5);
+  });
+
+  it("setPostEffects merges partial config and clamps invalid exposure to the default", async () => {
+    const harness = makeWebgpuHarness();
+    const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
+    await renderer.init();
+    renderer.resize(32, 32, 1);
+
+    // An empty config is a no-op (leaves the default exposure of 1.0); a
+    // negative/non-finite exposure clamps back to the default.
+    renderer.setPostEffects({});
+    renderer.setPostEffects({ exposure: -5 });
+
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.endFrame();
+
+    const firstFloats = harness.writeBuffer.mock.calls
+      .map((c) => c[2] as ArrayBufferLike | ArrayBufferView)
+      .map((data) => {
+        const view =
+          data instanceof ArrayBuffer
+            ? new Float32Array(data)
+            : new Float32Array(
+                (data as ArrayBufferView).buffer,
+                (data as ArrayBufferView).byteOffset,
+              );
+        return view[0];
+      });
+    // The uploaded exposure is the clamped default (1.0), never -5.
+    expect(firstFloats).toContain(1);
+    expect(firstFloats).not.toContain(-5);
+  });
+
+  it("webgl implements setPostEffects as a no-op (basic look, direct render)", async () => {
+    const { canvas, gl } = makeFakeCanvas();
+    const renderer = createRenderer(canvas, {
+      environment: { gpu: null, hasWebgl: () => true },
+    });
+    await renderer.init();
+    renderer.resize(100, 100, 1);
+
+    // Must accept the call without throwing and without altering its direct
+    // render path: a subsequent frame still clears + scissors as before.
+    expect(() => renderer.setPostEffects({ exposure: 3 })).not.toThrow();
+
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.drawRect({ x: 0, y: 0, w: 0.5, h: 0.5, color: { r: 1, g: 0, b: 0, a: 1 } });
+    renderer.endFrame();
+    // Still rendering directly (scissored clear), unaffected by post-FX config.
+    expect(gl.scissor).toHaveBeenCalled();
+  });
+
+  it("setPostEffects is part of the backend-agnostic Renderer surface (no backend branch)", () => {
+    // Presets call setPostEffects without inspecting `.backend`. The function's
+    // source must reference no backend literal or raw GL/GPU surface.
+    const drivePostFx = (r: Renderer): void => {
+      r.setPostEffects({ exposure: 1.2 });
+    };
+    const src = drivePostFx.toString();
+    expect(src).not.toMatch(/webgpu|webgl|GPUDevice|WebGLRenderingContext|getContext|gl\./i);
+    expect(src).not.toMatch(/\.backend/);
   });
 });

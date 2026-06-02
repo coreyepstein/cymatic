@@ -30,6 +30,7 @@ function makeFakeRenderer(): Renderer {
     beginFrame: vi.fn(),
     drawRect: vi.fn(),
     endFrame: vi.fn(),
+    setPostEffects: vi.fn(),
     dispose: rendererDispose,
   };
 }
