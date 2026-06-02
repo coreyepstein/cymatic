@@ -91,6 +91,9 @@ function makeStubPreset(): Preset & {
 
 // Import AFTER vi.mock so the component picks up the mocked core.
 import { Visualizer, type VisualizerRef } from "./index.js";
+import { createRenderer } from "@cymatic/core";
+
+const mockCreateRenderer = vi.mocked(createRenderer);
 
 afterEach(() => {
   cleanup();
@@ -173,5 +176,58 @@ describe("<Visualizer />", () => {
       expect(preset.calls.init).toBe(1);
     });
     expect(container.querySelector("canvas")).not.toBeNull();
+  });
+
+  it("falls back to webgl when a webgpu renderer's init() rejects at runtime", async () => {
+    // REGRESSION: WebGPU can be selected (navigator.gpu exists) yet still fail
+    // in init() — adapter blocklisted, device creation rejects, etc. The hook
+    // must dispose the dead WebGPU renderer and transparently rebuild forcing
+    // backend "webgl", mounting successfully with no unhandled rejection and no
+    // surfaced error.
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+
+    const webgpuDispose = vi.fn();
+    const failingWebgpu: Renderer = {
+      ...makeFakeRenderer(),
+      backend: "webgpu",
+      // init rejects once — the first (webgpu) attempt.
+      init: vi.fn(async () => {
+        throw new Error("WebGPU device acquisition failed (adapter blocklisted)");
+      }),
+      dispose: webgpuDispose,
+    };
+    const recoveredWebgl = makeFakeRenderer(); // backend: "webgl"
+
+    // First create() yields the failing webgpu renderer; the retry yields webgl.
+    mockCreateRenderer
+      .mockImplementationOnce(() => failingWebgpu)
+      .mockImplementationOnce(() => recoveredWebgl);
+
+    const preset = makeStubPreset();
+    const ref = createRef<VisualizerRef>();
+    render(<Visualizer ref={ref} preset={preset} microphone />);
+
+    // The preset only inits once the (recovered) renderer is up.
+    await waitFor(() => {
+      expect(preset.calls.init).toBe(1);
+    });
+
+    // The dead webgpu renderer was disposed and a webgl renderer was rebuilt.
+    expect(webgpuDispose).toHaveBeenCalledTimes(1);
+    expect(mockCreateRenderer).toHaveBeenCalledTimes(2);
+    const secondCallOpts = mockCreateRenderer.mock.calls[1]?.[1];
+    expect(secondCallOpts).toMatchObject({ backend: "webgl" });
+
+    // Mounted cleanly with no surfaced engine error.
+    await waitFor(() => {
+      expect(ref.current?.ready).toBe(true);
+    });
+    expect(ref.current?.error).toBeNull();
+
+    // No unhandled rejection escaped the fallback.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(unhandled).not.toHaveBeenCalled();
+    process.off("unhandledRejection", unhandled);
   });
 });

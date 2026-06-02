@@ -129,18 +129,38 @@ export function App(): JSX.Element {
     }
   }, [snippet]);
 
-  // Surface a setup error from the engine (e.g. mic denied, no GPU) without
-  // crashing. We poll the imperative handle since the ref does not re-render.
+  // Surface a setup error from the engine without crashing. We poll the
+  // imperative handle since the ref does not re-render. An engine error can come
+  // from two very different places — the microphone (permission denied, no
+  // device) or the renderer (WebGPU/WebGL initialization failed) — and they
+  // need different messaging, so we watch for it on every input kind, not just
+  // mic, and classify it below.
   const [engineError, setEngineError] = useState<Error | null>(null);
   useEffect(() => {
     setEngineError(null);
-    if (input.kind !== "mic") return;
     const id = window.setInterval(() => {
       const err = vizRef.current?.error ?? null;
       if (err) setEngineError(err);
     }, 400);
     return () => window.clearInterval(id);
   }, [input]);
+
+  // A mic failure is one of the standard getUserMedia DOMException names, or
+  // only plausible when the user actually asked for the microphone. Anything
+  // else surfacing from the engine is a renderer/initialization failure.
+  const isMicError =
+    engineError != null &&
+    input.kind === "mic" &&
+    (engineError.name === "NotAllowedError" ||
+      engineError.name === "NotFoundError" ||
+      engineError.name === "NotReadableError" ||
+      engineError.name === "SecurityError" ||
+      engineError.name === "OverconstrainedError" ||
+      engineError.name === "AbortError" ||
+      /microphone|getusermedia|permission|audio input/i.test(
+        engineError.message,
+      ));
+  const isRendererError = engineError != null && !isMicError;
 
   const micActive = input.kind === "mic" && !engineError;
 
@@ -230,14 +250,26 @@ export function App(): JSX.Element {
                 audioBuffer={input.kind === "file" ? input.buffer : undefined}
                 ariaLabel={`${selectedDef?.name ?? "cymatic"} visualizer`}
               />
-              {engineError && input.kind === "mic" ? (
+              {isMicError ? (
                 <div className="status-overlay">
                   <div className="status-card error">
                     <h3>Microphone unavailable</h3>
                     <p>
-                      {engineError.message ||
+                      {engineError?.message ||
                         "Microphone access was denied or is not available."}{" "}
                       You can still drop in an audio file to visualize instead.
+                    </p>
+                  </div>
+                </div>
+              ) : isRendererError ? (
+                <div className="status-overlay">
+                  <div className="status-card error">
+                    <h3>Renderer unavailable</h3>
+                    <p>
+                      {engineError?.message ||
+                        "The graphics renderer failed to initialize."}{" "}
+                      The live canvas cannot render in this browser — try a
+                      hardware-accelerated browser with WebGPU or WebGL enabled.
                     </p>
                   </div>
                 </div>

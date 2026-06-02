@@ -14,8 +14,11 @@
  */
 
 import {
+  defaultHasWebgl,
+  detectEnvironment,
   selectBackend,
   type BackendSelection,
+  type GpuLike,
   type RendererBackend,
   type RendererEnvironment,
 } from "./capabilities.js";
@@ -223,12 +226,36 @@ export function createRenderer(
   canvas: RenderCanvasLike,
   opts: CreateRendererOptions = {},
 ): Renderer {
-  const selection: BackendSelection = opts.backend ?? selectBackend(opts.environment);
+  // Resolve the environment exactly once. The same resolved environment must
+  // feed BOTH backend selection AND the WebGPU `gpu` lookup — otherwise the
+  // ambient `navigator.gpu` that selection saw is silently dropped before the
+  // WebGPU branch, and `createRenderer(canvas)` throws in real browsers.
+  const environment: RendererEnvironment = opts.environment ?? detectEnvironment();
+  const selection: BackendSelection = opts.backend ?? selectBackend(environment);
 
   switch (selection) {
     case "webgpu": {
-      const gpu = opts.gpu ?? (opts.environment?.gpu as GpuNavigatorLike | undefined);
+      // `environment.gpu` is the same value selection inspected. The structural
+      // capability shape (GpuLike) is widened to the WebGPU entrypoint shape
+      // (GpuNavigatorLike) at this single boundary — both are minimal views of
+      // `navigator.gpu`, so the cast (via the GpuLike alias, no `any`) is sound.
+      const envGpu: GpuLike | null | undefined = environment.gpu;
+      const gpu =
+        opts.gpu ?? (envGpu as GpuNavigatorLike | null | undefined) ?? undefined;
       if (!gpu) {
+        // No usable `gpu` entrypoint. If WebGPU was explicitly forced by the
+        // caller, honour the strict contract and throw. Otherwise this is the
+        // auto-selection path: degrade gracefully to WebGL when it is available
+        // rather than failing the whole renderer.
+        if (opts.backend === "webgpu") {
+          throw new Error(
+            "createRenderer: WebGPU selected but no `gpu` entrypoint was provided.",
+          );
+        }
+        const hasWebgl = environment.hasWebgl ?? defaultHasWebgl;
+        if (hasWebgl()) {
+          return new WebglRenderer({ canvas });
+        }
         throw new Error(
           "createRenderer: WebGPU selected but no `gpu` entrypoint was provided.",
         );

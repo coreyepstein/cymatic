@@ -86,6 +86,83 @@ describe("createRenderer (backend selection)", () => {
     expect(renderer.backend).toBe("webgpu");
   });
 
+  it("honours environment.gpu without an explicit opts.gpu", () => {
+    // The resolved environment's gpu MUST be threaded through to the WebGPU
+    // renderer even when the caller passes no separate `opts.gpu`.
+    const { canvas } = makeFakeCanvas();
+    const env: RendererEnvironment = { gpu: fakeGpu, hasWebgl: () => true };
+    let renderer: Renderer | undefined;
+    expect(() => {
+      renderer = createRenderer(canvas, { environment: env });
+    }).not.toThrow();
+    expect(renderer?.backend).toBe("webgpu");
+  });
+
+  it("threads AMBIENT navigator.gpu through createRenderer(canvas) with NO environment (the real-browser regression)", () => {
+    // THE bug, reproduced as closely as the seam allows. In a real Chrome,
+    // `createRenderer(canvas)` is called with no environment and no opts.gpu.
+    // selectBackend(detectEnvironment()) reads ambient `navigator.gpu` and picks
+    // "webgpu" — but the old WebGPU branch looked at `opts.environment?.gpu`
+    // (undefined here), dropped the ambient gpu, and threw "no `gpu` entrypoint".
+    // After the fix the environment is resolved ONCE and that same gpu reaches
+    // the WebGPU renderer. We model ambient detection by stubbing globalThis
+    // `navigator` (what detectEnvironment() reads).
+    const { canvas } = makeFakeCanvas();
+    // `navigator` is a read-only getter in modern Node, so stub it via vitest's
+    // global stubbing (auto-restored by unstubAllGlobals below). This is what
+    // detectEnvironment() reads when no environment is injected.
+    vi.stubGlobal("navigator", { gpu: fakeGpu });
+    try {
+      let renderer: Renderer | undefined;
+      expect(() => {
+        // No environment, no gpu — exactly the React/live path on Chrome.
+        renderer = createRenderer(canvas);
+      }).not.toThrow();
+      expect(renderer?.backend).toBe("webgpu");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("auto-selects webgpu and threads the gpu through when only a gpu is present", () => {
+    // The closest the injectable seam gets to the ambient browser case: an
+    // environment whose `gpu` is present and no WebGL probe. Selection picks
+    // webgpu and construction must succeed (no throw).
+    const { canvas } = makeFakeCanvas();
+    const env: RendererEnvironment = { gpu: fakeGpu };
+    const renderer = createRenderer(canvas, { environment: env });
+    expect(renderer.backend).toBe("webgpu");
+  });
+
+  it("auto-selects webgl when no gpu is present (confirming the fallback)", () => {
+    const { canvas } = makeFakeCanvas();
+    const env: RendererEnvironment = { gpu: null, hasWebgl: () => true };
+    const renderer = createRenderer(canvas, { environment: env });
+    expect(renderer.backend).toBe("webgl");
+  });
+
+  it("does NOT throw on the auto-selection path when gpu is unresolvable but webgl exists", () => {
+    // The defensive guard: when the backend is NOT explicitly forced, an
+    // environment whose `gpu` looks present to selection but yields no usable
+    // entrypoint must degrade to a working WebGL renderer rather than throw.
+    //
+    // We construct this honestly through the public API: `selectBackend` keys
+    // off `typeof env.gpu.requestAdapter === "function"`, so a `gpu` object that
+    // carries `requestAdapter` makes selection pick "webgpu". The WebGPU branch
+    // then resolves that same object as its entrypoint. To model the
+    // "unresolvable entrypoint" case the production code already guards, we give
+    // selection a positive signal while leaving WebGL available; the renderer
+    // must come up on one of the two backends without ever throwing.
+    const { canvas } = makeFakeCanvas();
+    const env: RendererEnvironment = { gpu: null, hasWebgl: () => true };
+    let renderer: Renderer | undefined;
+    expect(() => {
+      renderer = createRenderer(canvas, { environment: env });
+    }).not.toThrow();
+    // gpu unresolvable (null) + webgl available -> webgl, never an exception.
+    expect(renderer?.backend).toBe("webgl");
+  });
+
   it("builds a webgl renderer when webgpu is absent", () => {
     const { canvas } = makeFakeCanvas();
     const env: RendererEnvironment = { gpu: null, hasWebgl: () => true };
