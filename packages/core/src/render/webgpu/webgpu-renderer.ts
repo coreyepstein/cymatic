@@ -43,6 +43,7 @@ import {
   type BlendMode,
   type BloomConfig,
   type DrawingBufferSize,
+  type FeedbackConfig,
   type GlowSpec,
   type GradientFill,
   type LineSpec,
@@ -97,6 +98,22 @@ const DEFAULT_BLOOM_RADIUS = 1;
 /** Cinematic vignette defaults. */
 const DEFAULT_VIGNETTE_ENABLED = true;
 const DEFAULT_VIGNETTE_AMOUNT = 0.35;
+
+/**
+ * Feedback / trail defaults. Disabled by default — presets opt in. The decay
+ * default (0.9) is a conservative, clearly-visible-but-bounded trail. Decay is
+ * clamped below 1 so trails always eventually fade (1.0 would never decay and
+ * could accumulate unboundedly in the HDR history).
+ */
+const DEFAULT_FEEDBACK_ENABLED = false;
+const DEFAULT_FEEDBACK_DECAY = 0.9;
+const MAX_FEEDBACK_DECAY = 0.999;
+
+/**
+ * Bytes in the FEEDBACK uniform buffer: decay (+ 3 pad) → 4 × f32 = 16 bytes
+ * (one std140 vec4 slot). Re-uploaded only when the decay changes.
+ */
+const FEEDBACK_UNIFORM_BYTES = 16;
 
 /** Number of downsampled bloom mip levels (clamped 2–4 of the design range). */
 const BLOOM_MIP_LEVELS = 4;
@@ -640,6 +657,54 @@ fn fs_upsample(in : VsOut) -> @location(0) vec4<f32> {
 `;
 
 /**
+ * WGSL for the FEEDBACK COMPOSITE pass: `combined = scene + history * decay`.
+ * Reads the freshly-rendered HDR scene AND the persistent (previous-frame)
+ * history texture, scales the history by `decay`, and adds it to the scene. The
+ * result is the trail-accumulated frame that feeds bloom + tonemap and is then
+ * stored back into history. binding 0 = feedback params uniform (decay in `.x`),
+ * 1 = HDR scene texture, 2 = sampler, 3 = history texture.
+ */
+const FEEDBACK_SHADER = /* wgsl */ `
+${FULLSCREEN_VS}
+
+struct FeedbackParams {
+  decay : f32,
+  padA : f32,
+  padB : f32,
+  padC : f32,
+};
+
+@group(0) @binding(0) var<uniform> params : FeedbackParams;
+@group(0) @binding(1) var sceneTex : texture_2d<f32>;
+@group(0) @binding(2) var srcSampler : sampler;
+@group(0) @binding(3) var historyTex : texture_2d<f32>;
+
+@fragment
+fn fs_feedback(in : VsOut) -> @location(0) vec4<f32> {
+  let scene = textureSample(sceneTex, srcSampler, in.uv).rgb;
+  let history = textureSample(historyTex, srcSampler, in.uv).rgb;
+  return vec4<f32>(scene + history * params.decay, 1.0);
+}
+`;
+
+/**
+ * WGSL for a plain COPY pass: sample a source texture and write it through
+ * unchanged. Used to copy the feedback-combined result back into the HDR scene
+ * target (so bloom + post read it unchanged). binding 0 = source, 1 = sampler.
+ */
+const COPY_SHADER = /* wgsl */ `
+${FULLSCREEN_VS}
+
+@group(0) @binding(0) var srcTex : texture_2d<f32>;
+@group(0) @binding(1) var srcSampler : sampler;
+
+@fragment
+fn fs_copy(in : VsOut) -> @location(0) vec4<f32> {
+  return vec4<f32>(textureSample(srcTex, srcSampler, in.uv).rgb, 1.0);
+}
+`;
+
+/**
  * WGSL for the POST / COMPOSITE pass. Samples the HDR scene AND the (largest)
  * bloom mip, adds `bloom * bloomIntensity`, applies exposure + ACES tonemap,
  * then a radial vignette darkening. Writes to the swapchain. binding 0 = post
@@ -733,6 +798,11 @@ interface ResolvedVignette {
   amount: number;
 }
 
+interface ResolvedFeedback {
+  enabled: boolean;
+  decay: number;
+}
+
 /**
  * A growable per-kind instance buffer: owns a `GPUBuffer` (vertex usage), its
  * capacity in instances, and a CPU staging `Float32Array`. {@link ensure} grows
@@ -818,6 +888,14 @@ export class WebgpuRenderer implements Renderer {
   /** Layout for upsample (texture + sampler, no uniform). */
   private upsampleBindGroupLayout: GpuBindGroupLayoutLike | null = null;
 
+  // Feedback / trail pipelines + their bind-group layouts.
+  /** Feedback composite: scene + history*decay (uniform + scene + sampler + history). */
+  private feedbackPipeline: GpuRenderPipelineLike | null = null;
+  private feedbackBindGroupLayout: GpuBindGroupLayoutLike | null = null;
+  /** Plain copy (combined → HDR scene target): texture + sampler. */
+  private copyPipeline: GpuRenderPipelineLike | null = null;
+  private copyBindGroupLayout: GpuBindGroupLayoutLike | null = null;
+
   private format = "bgra8unorm";
   private size: DrawingBufferSize = { width: 0, height: 0 };
 
@@ -844,10 +922,26 @@ export class WebgpuRenderer implements Renderer {
   private sampler: GpuSamplerLike | null = null;
   private postUniformBuffer: GpuBufferLike | null = null;
   private bloomUniformBuffer: GpuBufferLike | null = null;
+  private feedbackUniformBuffer: GpuBufferLike | null = null;
   private postBindGroup: GpuBindGroupLike | null = null;
 
   /** Downsampled bloom mip chain (created on resize). */
   private bloomMips: BloomMip[] = [];
+
+  /**
+   * Ping-pong HDR "history" textures for the feedback / trail buffer (created
+   * on resize). Each frame the feedback pass READS `history[historyRead]`
+   * (last frame's combined output) and WRITES the new combined output into
+   * `history[1 - historyRead]`; then `historyRead` flips. Two textures avoid a
+   * read/write hazard. History resets (cleared) on resize. `historyPrimed`
+   * tracks whether the read texture holds a real prior frame yet (it is cleared
+   * to black on the first feedback frame after a resize/enable so trails start
+   * from nothing rather than garbage).
+   */
+  private historyTex: [GpuTextureLike, GpuTextureLike] | null = null;
+  private historyView: [GpuTextureViewLike, GpuTextureViewLike] | null = null;
+  private historyRead = 0;
+  private historyPrimed = false;
 
   /** Post-FX state. Exposure default is neutral (1.0). */
   private exposure = DEFAULT_EXPOSURE;
@@ -861,8 +955,15 @@ export class WebgpuRenderer implements Renderer {
     enabled: DEFAULT_VIGNETTE_ENABLED,
     amount: DEFAULT_VIGNETTE_AMOUNT,
   };
+  /** Feedback / trail state. Disabled by default; presets opt in. */
+  private feedback: ResolvedFeedback = {
+    enabled: DEFAULT_FEEDBACK_ENABLED,
+    decay: DEFAULT_FEEDBACK_DECAY,
+  };
   /** Set when composite params changed and the uniform buffer needs reupload. */
   private postParamsDirty = true;
+  /** Set when the feedback decay changed and its uniform needs reupload. */
+  private feedbackParamsDirty = true;
 
   constructor(options: WebgpuRendererOptions) {
     this.canvas = options.canvas;
@@ -1104,6 +1205,56 @@ export class WebgpuRenderer implements Renderer {
       primitive: { topology: "triangle-list" },
     });
 
+    // FEEDBACK composite pipeline: scene + history*decay → combined HDR. Layout
+    // is uniform(decay) + scene texture + sampler + history texture.
+    const feedbackLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: 0x2, buffer: { type: "uniform" } },
+        { binding: 1, visibility: 0x2, texture: { sampleType: "float", viewDimension: "2d" } },
+        { binding: 2, visibility: 0x2, sampler: { type: "filtering" } },
+        { binding: 3, visibility: 0x2, texture: { sampleType: "float", viewDimension: "2d" } },
+      ],
+    });
+    this.feedbackBindGroupLayout = feedbackLayout;
+    const feedbackPipelineLayout = device.createPipelineLayout({
+      bindGroupLayouts: [feedbackLayout],
+    });
+    const feedbackModule = device.createShaderModule({ code: FEEDBACK_SHADER });
+    this.feedbackPipeline = device.createRenderPipeline({
+      layout: feedbackPipelineLayout,
+      vertex: { module: feedbackModule, entryPoint: "vs_fullscreen" },
+      fragment: {
+        module: feedbackModule,
+        entryPoint: "fs_feedback",
+        targets: [{ format: HDR_FORMAT }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+
+    // COPY pipeline (combined → HDR scene target): texture + sampler. Reuses the
+    // upsample-style two-binding layout shape but as its own layout for clarity.
+    const copyLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: 0x2, texture: { sampleType: "float", viewDimension: "2d" } },
+        { binding: 1, visibility: 0x2, sampler: { type: "filtering" } },
+      ],
+    });
+    this.copyBindGroupLayout = copyLayout;
+    const copyPipelineLayout = device.createPipelineLayout({
+      bindGroupLayouts: [copyLayout],
+    });
+    const copyModule = device.createShaderModule({ code: COPY_SHADER });
+    this.copyPipeline = device.createRenderPipeline({
+      layout: copyPipelineLayout,
+      vertex: { module: copyModule, entryPoint: "vs_fullscreen" },
+      fragment: {
+        module: copyModule,
+        entryPoint: "fs_copy",
+        targets: [{ format: HDR_FORMAT }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+
     // POST pipeline: fullscreen triangle sampling HDR + bloom → swapchain.
     const postModule = device.createShaderModule({ code: POST_SHADER });
     const postLayout = device.createBindGroupLayout({
@@ -1139,7 +1290,12 @@ export class WebgpuRenderer implements Renderer {
       size: BLOOM_UNIFORM_BYTES,
       usage: BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST,
     });
+    this.feedbackUniformBuffer = device.createBuffer({
+      size: FEEDBACK_UNIFORM_BYTES,
+      usage: BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST,
+    });
     this.postParamsDirty = true;
+    this.feedbackParamsDirty = true;
 
     this.device = device;
     this.context = ctx;
@@ -1174,6 +1330,28 @@ export class WebgpuRenderer implements Renderer {
     }
     if (config.vignette) {
       this.applyVignette(config.vignette);
+    }
+    if (config.feedback) {
+      this.applyFeedback(config.feedback);
+    }
+  }
+
+  private applyFeedback(feedback: FeedbackConfig): void {
+    if (feedback.enabled != null) {
+      if (feedback.enabled !== this.feedback.enabled) {
+        this.feedback.enabled = feedback.enabled;
+        // Re-priming history when (re)enabling so trails start from black, not
+        // whatever stale content the history textures hold.
+        this.historyPrimed = false;
+      }
+    }
+    if (feedback.decay != null) {
+      const d = feedback.decay;
+      const next = Number.isFinite(d) ? Math.min(Math.max(d, 0), MAX_FEEDBACK_DECAY) : DEFAULT_FEEDBACK_DECAY;
+      if (next !== this.feedback.decay) {
+        this.feedback.decay = next;
+        this.feedbackParamsDirty = true;
+      }
     }
   }
 
@@ -1297,6 +1475,19 @@ export class WebgpuRenderer implements Renderer {
       this.postParamsDirty = false;
     }
 
+    // Upload feedback decay when dirty (only consumed when feedback is active).
+    if (this.feedbackParamsDirty && this.feedbackUniformBuffer) {
+      const params = new Float32Array([this.feedback.decay, 0, 0, 0]);
+      device.queue.writeBuffer(
+        this.feedbackUniformBuffer,
+        0,
+        params.buffer,
+        params.byteOffset,
+        FEEDBACK_UNIFORM_BYTES,
+      );
+      this.feedbackParamsDirty = false;
+    }
+
     const encoder = device.createCommandEncoder();
 
     // ── PASS 1: SCENE → offscreen HDR texture ──
@@ -1318,6 +1509,23 @@ export class WebgpuRenderer implements Renderer {
       scenePass.draw(6, draw.instanceCount, 0, draw.firstInstance);
     }
     scenePass.end();
+
+    // ── FEEDBACK / TRAIL PASSES (optional) → blend in the decayed history ──
+    // When feedback is active, composite the previous frame's combined output
+    // (the "history" texture) into the freshly-rendered scene scaled by `decay`,
+    // then copy that combined result back INTO the HDR scene target so bloom +
+    // post read it unchanged. The combined result is ALSO what gets stored as
+    // the next frame's history (it lives in the write-history texture after the
+    // feedback pass), so prior frames fade out geometrically over time.
+    //
+    // Ping-pong: read history[historyRead], write history[1-historyRead]. On the
+    // first feedback frame after a resize/enable the read texture is not yet
+    // primed, so the feedback pass is skipped (the scene IS the first history)
+    // and we just seed history from the scene — trails start from nothing.
+    const feedbackActive = this.feedback.enabled && this.historyView != null;
+    if (feedbackActive) {
+      this.runFeedback(device, encoder, hdrView);
+    }
 
     // ── BLOOM PASSES (optional) → downsampled mip chain ──
     // When bloom is enabled, run the bright-pass + separable blur per mip and
@@ -1348,6 +1556,84 @@ export class WebgpuRenderer implements Renderer {
     postPass.end();
 
     device.queue.submit([encoder.finish()]);
+  }
+
+  /**
+   * Run the feedback / trail chain for this frame, mutating `hdrView` in place so
+   * the rest of the pipeline (bloom + post) sees the trail-accumulated result.
+   *
+   * Two cases:
+   *  - NOT primed yet (first feedback frame after resize/enable): there is no
+   *    valid prior frame, so we just SEED history from the current scene (copy
+   *    hdr → write-history) and leave the scene untouched (no trail this frame).
+   *  - primed: `combined = scene + readHistory * decay` written into the
+   *    write-history texture, then copied back into `hdrView` so bloom/post read
+   *    the combined frame. The write-history holds the combined result, which
+   *    becomes next frame's read-history after the ping-pong flip.
+   *
+   * Either way `historyRead` flips at the end so the texture just written becomes
+   * next frame's read source.
+   */
+  private runFeedback(
+    device: GpuDeviceLike,
+    encoder: GpuCommandEncoderLike,
+    hdrView: GpuTextureViewLike,
+  ): void {
+    const feedback = this.feedbackPipeline;
+    const copy = this.copyPipeline;
+    const feedbackLayout = this.feedbackBindGroupLayout;
+    const copyLayout = this.copyBindGroupLayout;
+    const sampler = this.sampler;
+    const feedbackUniform = this.feedbackUniformBuffer;
+    const views = this.historyView;
+    if (!feedback || !copy || !feedbackLayout || !copyLayout || !sampler || !feedbackUniform || !views) {
+      return;
+    }
+    const readView = views[this.historyRead];
+    const writeView = views[1 - this.historyRead]!;
+
+    if (!this.historyPrimed) {
+      // SEED: copy the current scene into the write-history texture. No trail is
+      // applied this frame (there is no prior frame to blend). The scene target
+      // is left as-is so this frame renders plainly.
+      this.fullscreenPass(
+        encoder,
+        writeView,
+        copy,
+        this.makeUpsampleBindGroup(device, copyLayout, sampler, hdrView),
+        { r: 0, g: 0, b: 0, a: 1 },
+      );
+      this.historyPrimed = true;
+    } else {
+      // COMPOSITE: combined = scene + readHistory*decay → write-history texture.
+      this.fullscreenPass(
+        encoder,
+        writeView,
+        feedback,
+        device.createBindGroup({
+          layout: feedbackLayout,
+          entries: [
+            { binding: 0, resource: { buffer: feedbackUniform } },
+            { binding: 1, resource: hdrView },
+            { binding: 2, resource: sampler },
+            { binding: 3, resource: readView! },
+          ],
+        }),
+        { r: 0, g: 0, b: 0, a: 1 },
+      );
+      // COPY the combined result back into the HDR scene target so bloom + post
+      // (whose bind groups reference hdrView) read the trail-accumulated frame.
+      this.fullscreenPass(
+        encoder,
+        hdrView,
+        copy,
+        this.makeUpsampleBindGroup(device, copyLayout, sampler, writeView),
+        { r: 0, g: 0, b: 0, a: 1 },
+      );
+    }
+
+    // Ping-pong: the texture we just wrote becomes next frame's read source.
+    this.historyRead = 1 - this.historyRead;
   }
 
   /**
@@ -1528,9 +1814,10 @@ export class WebgpuRenderer implements Renderer {
     const { width, height } = this.size;
     if (width <= 0 || height <= 0) return;
 
-    // Release the prior HDR target + bloom mips before allocating anew.
+    // Release the prior HDR target + bloom mips + history before allocating anew.
     this.hdrTexture?.destroy?.();
     this.releaseBloomMips();
+    this.releaseHistory();
 
     const texture = device.createTexture({
       size: { width, height },
@@ -1540,6 +1827,22 @@ export class WebgpuRenderer implements Renderer {
     const view = texture.createView();
     this.hdrTexture = texture;
     this.hdrView = view;
+
+    // (Re)create the feedback / trail history ping-pong pair at full resolution.
+    // History resets on resize: re-priming ensures trails restart from black
+    // rather than blending stale (or differently-sized) content.
+    const makeHistory = (): GpuTextureLike =>
+      device.createTexture({
+        size: { width, height },
+        format: HDR_FORMAT,
+        usage: TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING,
+      });
+    const h0 = makeHistory();
+    const h1 = makeHistory();
+    this.historyTex = [h0, h1];
+    this.historyView = [h0.createView(), h1.createView()];
+    this.historyRead = 0;
+    this.historyPrimed = false;
 
     // Build the downsampled bloom mip chain (each level half the prior, min 1px).
     this.bloomMips = [];
@@ -1588,6 +1891,18 @@ export class WebgpuRenderer implements Renderer {
       mip.texB.destroy?.();
     }
     this.bloomMips = [];
+  }
+
+  /** Destroy and clear the feedback / trail history textures. */
+  private releaseHistory(): void {
+    if (this.historyTex) {
+      this.historyTex[0].destroy?.();
+      this.historyTex[1].destroy?.();
+    }
+    this.historyTex = null;
+    this.historyView = null;
+    this.historyRead = 0;
+    this.historyPrimed = false;
   }
 
   /**
@@ -1721,14 +2036,21 @@ export class WebgpuRenderer implements Renderer {
     this.hdrTexture = null;
     this.hdrView = null;
     this.releaseBloomMips();
+    this.releaseHistory();
     this.postUniformBuffer?.destroy?.();
     this.postUniformBuffer = null;
     this.bloomUniformBuffer?.destroy?.();
     this.bloomUniformBuffer = null;
+    this.feedbackUniformBuffer?.destroy?.();
+    this.feedbackUniformBuffer = null;
     this.postBindGroup = null;
     this.postBindGroupLayout = null;
     this.bloomBindGroupLayout = null;
     this.upsampleBindGroupLayout = null;
+    this.feedbackPipeline = null;
+    this.feedbackBindGroupLayout = null;
+    this.copyPipeline = null;
+    this.copyBindGroupLayout = null;
     this.sampler = null;
     this.rectPipelineAlpha = null;
     this.rectPipelineAdd = null;
@@ -1755,7 +2077,9 @@ export class WebgpuRenderer implements Renderer {
       radius: DEFAULT_BLOOM_RADIUS,
     };
     this.vignette = { enabled: DEFAULT_VIGNETTE_ENABLED, amount: DEFAULT_VIGNETTE_AMOUNT };
+    this.feedback = { enabled: DEFAULT_FEEDBACK_ENABLED, decay: DEFAULT_FEEDBACK_DECAY };
     this.postParamsDirty = true;
+    this.feedbackParamsDirty = true;
   }
 }
 

@@ -33,6 +33,7 @@ export type {
   PostEffectsConfig,
   BloomConfig,
   VignetteConfig,
+  FeedbackConfig,
 } from "./renderer.js";
 export {
   createRenderer,
@@ -41,6 +42,8 @@ export {
   expandLineToQuad,
   normalizedToClip,
   lineBoundsRect,
+  feedbackCombine,
+  feedbackSequence,
 } from "./renderer.js";
 
 export type { WebglCanvasLike, WebglRendererOptions } from "./webgl/webgl-renderer.js";

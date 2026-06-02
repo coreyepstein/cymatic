@@ -14,6 +14,8 @@ export default defineConfig({
         "bloom-harness": fileURLToPath(new URL("./bloom-harness.html", import.meta.url)),
         // The V2-03 rich-primitives verification harness (e2e, not user-facing).
         "primitives-harness": fileURLToPath(new URL("./primitives-harness.html", import.meta.url)),
+        // The V2-04 feedback / trail verification harness (e2e, not user-facing).
+        "feedback-harness": fileURLToPath(new URL("./feedback-harness.html", import.meta.url)),
       },
     },
   },

@@ -121,6 +121,14 @@ export interface PostEffectsConfig {
    * composite/tonemap pass. WebGPU honours this; WebGL no-ops.
    */
   vignette?: VignetteConfig;
+  /**
+   * Feedback / trail buffer: blends the PREVIOUS frame (a persistent HDR
+   * "history" texture) into the current scene with a per-frame decay before
+   * bloom + tonemap, so moving glows/shapes leave luminous tails. The combined
+   * result is then stored back into history for the next frame. WebGPU honours
+   * this; WebGL no-ops. Disabled by default — presets opt in.
+   */
+  feedback?: FeedbackConfig;
 }
 
 /** Bloom-stage configuration. All fields optional; merged onto current state. */
@@ -142,6 +150,35 @@ export interface BloomConfig {
    * is the natural mip-scaled radius; higher widens the glow. Clamped to `>= 0`.
    */
   radius?: number;
+}
+
+/**
+ * Feedback / trail-buffer configuration. All fields optional; merged onto
+ * current state.
+ *
+ * When enabled, the renderer keeps a persistent HDR "history" texture of the
+ * previous frame's combined output. Each frame, that history is composited into
+ * the current scene scaled by {@link decay} — `combined = scene + history *
+ * decay` — so prior frames fade out geometrically over time, leaving motion
+ * trails. The combined result feeds bloom + tonemap as usual and is then stored
+ * back into history for the next frame. Two textures ping-pong to avoid a
+ * read/write hazard.
+ *
+ * The trail is a PURE function of prior frames and {@link decay}, so the offline
+ * (fixed-fps) render path stays deterministic: identical inputs produce
+ * identical output across runs.
+ */
+export interface FeedbackConfig {
+  /** Whether the feedback / trail stage runs at all. Default `false`. */
+  enabled?: boolean;
+  /**
+   * Per-frame retention of the previous frame, in `[0, 1)`. `0` keeps no
+   * history (no trail); values near `1` (e.g. `0.9`) leave long, slowly-fading
+   * tails. Clamped to `[0, 0.999]` by the backend so trails always eventually
+   * decay (a decay of exactly `1` would never fade and could accumulate
+   * unboundedly). Default `0.9`.
+   */
+  decay?: number;
 }
 
 /** Vignette-stage configuration. All fields optional; merged onto current state. */
@@ -468,6 +505,40 @@ export function lineBoundsRect(line: Pick<LineSpec, "x0" | "y0" | "x1" | "y1" | 
     if (c.y > maxY) maxY = c.y;
   }
   return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+/**
+ * The per-frame feedback / trail recurrence, as a pure function: given the
+ * `scene` luminance/color value rendered THIS frame and the `history` value
+ * retained from the PREVIOUS frame, the combined output is
+ * `scene + history * decay`. This is exactly what the WebGPU feedback-composite
+ * shader computes per channel; modelling it here gives the trail a single
+ * tested definition AND lets the offline (fixed-fps) determinism check prove the
+ * sequence is a pure function of prior frames + decay (no time/RNG), so two runs
+ * with identical inputs produce identical output. `decay` is clamped to
+ * `[0, 0.999]` so trails always eventually fade.
+ */
+export function feedbackCombine(scene: number, history: number, decay: number): number {
+  const d = Number.isFinite(decay) ? Math.min(Math.max(decay, 0), 0.999) : 0.9;
+  return scene + history * d;
+}
+
+/**
+ * Run the feedback recurrence over a sequence of per-frame `scene` values,
+ * returning the combined (trail-accumulated) value at each frame. Frame `i`'s
+ * output is `scene[i] + decay * output[i-1]` (history starts at 0). Pure: no
+ * time, no RNG — so the offline path is deterministic across runs. Used by the
+ * determinism unit test and as the reference the GPU path mirrors.
+ */
+export function feedbackSequence(scene: readonly number[], decay: number): number[] {
+  const out: number[] = [];
+  let history = 0;
+  for (const s of scene) {
+    const combined = feedbackCombine(s, history, decay);
+    out.push(combined);
+    history = combined;
+  }
+  return out;
 }
 
 /** A canvas usable by either backend (the union of both backends' needs). */

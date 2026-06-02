@@ -297,9 +297,10 @@ export class WebglRenderer implements Renderer {
 
   setPostEffects(_config: PostEffectsConfig): void {
     // No-op for the WebGL backend: cinematic post-processing (HDR offscreen
-    // target, tonemap/exposure, bloom, …) is WebGPU-only. WebGL keeps its basic
-    // direct-render look. Accepting and ignoring the config keeps the
-    // preset/React call site backend-agnostic — callers never branch.
+    // target, tonemap/exposure, bloom, vignette, feedback/trails, …) is
+    // WebGPU-only. WebGL keeps its basic direct-render look. Accepting and
+    // ignoring the config keeps the preset/React call site backend-agnostic —
+    // callers never branch.
   }
 
   private pushQuad(

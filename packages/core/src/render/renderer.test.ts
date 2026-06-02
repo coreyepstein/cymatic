@@ -5,6 +5,8 @@ import {
   computeDrawingBufferSize,
   createRenderer,
   expandLineToQuad,
+  feedbackCombine,
+  feedbackSequence,
   lineBoundsRect,
   normalizedToClip,
   toRgba,
@@ -289,11 +291,12 @@ describe("preset-facing call path is backend-agnostic", () => {
     };
     expect(sceneDesc.colorAttachments[0]?.loadOp).toBe("clear");
     expect(sceneDesc.colorAttachments[0]?.clearValue).toEqual({ r: 0.1, g: 0.2, b: 0.3, a: 1 });
-    // Eleven pipelines are built once in init(): the scene primitives (rect
+    // Thirteen pipelines are built once in init(): the scene primitives (rect
     // alpha+add, gradient alpha+add, glow, line alpha+add = 7) + bloom (bright +
-    // blur + upsample = 3) + post (1). With bloom off only the rect scene
-    // pipeline + post are BOUND this frame.
-    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(11);
+    // blur + upsample = 3) + feedback/trail (feedback + copy = 2) + post (1).
+    // With bloom + feedback off only the rect scene pipeline + post are BOUND
+    // this frame.
+    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(13);
     // The offscreen HDR target is allocated as an rgba16float texture.
     expect(harness.createTexture).toHaveBeenCalled();
     const texDesc = harness.createTexture.mock.calls[0]?.[0] as { format: string };
@@ -544,11 +547,12 @@ describe("drawRect primitive (backend-agnostic)", () => {
       renderer.endFrame();
     }
 
-    // Eleven pipelines (7 scene primitive variants + bright + blur + upsample +
-    // post) from eight shader modules (rect, gradient, glow, line, bright, blur,
-    // upsample, post) — all built once in init().
-    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(11);
-    expect(harness.createShaderModule).toHaveBeenCalledTimes(8);
+    // Thirteen pipelines (7 scene primitive variants + bright + blur + upsample +
+    // feedback + copy + post) from ten shader modules (rect, gradient, glow,
+    // line, bright, blur, upsample, feedback, copy, post) — all built once in
+    // init().
+    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(13);
+    expect(harness.createShaderModule).toHaveBeenCalledTimes(10);
     // With bloom off, two passes per frame (scene + post) => 6 across 3 frames.
     expect(harness.passDescriptors).toHaveLength(6);
     // Each frame: instanced scene draw then fullscreen post draw.
@@ -793,15 +797,16 @@ describe("bloom + vignette post-FX (V2-02)", () => {
     expect(onHarness.submit).toHaveBeenCalledTimes(1);
   });
 
-  it("builds eleven pipelines (scene primitives + bloom + post) once", async () => {
+  it("builds thirteen pipelines (scene primitives + bloom + feedback + post) once", async () => {
     const harness = makeWebgpuHarness();
     const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
     await renderer.init();
     renderer.resize(64, 64, 1);
     // Seven scene-primitive pipelines (rect/gradient/line ×{alpha,additive} +
-    // glow) + bloom (bright + blur + upsample) + post — all built once in init().
-    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(11);
-    expect(harness.createShaderModule).toHaveBeenCalledTimes(8);
+    // glow) + bloom (bright + blur + upsample) + feedback (feedback + copy) +
+    // post — all built once in init().
+    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(13);
+    expect(harness.createShaderModule).toHaveBeenCalledTimes(10);
   });
 
   it("honours bloom + vignette config: the composite uniform records the values", async () => {
@@ -873,6 +878,194 @@ describe("bloom + vignette post-FX (V2-02)", () => {
 
     const writes = decodeUniformWrites(harness.writeBuffer);
     expect(writesContainVec(writes, [1, 0.6, 1, 1])).toBe(true);
+  });
+});
+
+describe("feedback / trail buffer (V2-04)", () => {
+  /** A bloom+vignette-off renderer so the only variable is the feedback chain. */
+  async function makeReady() {
+    const harness = makeWebgpuHarness();
+    const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
+    await renderer.init();
+    renderer.setPostEffects({ bloom: { enabled: false }, vignette: { enabled: false } });
+    renderer.resize(64, 64, 1);
+    return { harness, renderer };
+  }
+
+  it("is DISABLED by default: a frame is the V2-02 two-pass path (scene + post)", async () => {
+    const { harness, renderer } = await makeReady();
+    // No feedback config set → feedback off by default.
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.drawGlow({ x: 0.5, y: 0.5, radius: 0.1, color: { r: 4, g: 4, b: 4, a: 1 } });
+    renderer.endFrame();
+    // Exactly the two-pass substrate: scene→offscreen, post→swapchain. No
+    // feedback/copy passes inserted.
+    expect(harness.passDescriptors).toHaveLength(2);
+  });
+
+  it("enabling feedback adds passes; first frame SEEDS history (one copy), later frames COMPOSITE (feedback + copy)", async () => {
+    const { harness, renderer } = await makeReady();
+    renderer.setPostEffects({ feedback: { enabled: true, decay: 0.9 } });
+
+    // FRAME 1: history not primed yet → ONE seed copy pass inserted between
+    // scene and post. So scene(1) + seedCopy(1) + post(1) = 3 passes.
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.drawGlow({ x: 0.3, y: 0.5, radius: 0.1, color: { r: 4, g: 4, b: 4, a: 1 } });
+    renderer.endFrame();
+    expect(harness.passDescriptors).toHaveLength(3);
+
+    // FRAME 2: history primed → feedback-composite pass + copy-back pass. So
+    // scene(1) + feedback(1) + copyBack(1) + post(1) = 4 passes THIS frame.
+    const before = harness.passDescriptors.length;
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.drawGlow({ x: 0.5, y: 0.5, radius: 0.1, color: { r: 4, g: 4, b: 4, a: 1 } });
+    renderer.endFrame();
+    expect(harness.passDescriptors.length - before).toBe(4);
+  });
+
+  it("disabling feedback reverts to the V2-02 two-pass path", async () => {
+    const { harness, renderer } = await makeReady();
+    renderer.setPostEffects({ feedback: { enabled: true, decay: 0.9 } });
+    // Prime + composite a couple of frames with feedback on.
+    for (let f = 0; f < 2; f++) {
+      renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+      renderer.drawGlow({ x: 0.5, y: 0.5, radius: 0.1, color: { r: 4, g: 4, b: 4, a: 1 } });
+      renderer.endFrame();
+    }
+    // Now turn feedback OFF and render one more frame.
+    renderer.setPostEffects({ feedback: { enabled: false } });
+    const before = harness.passDescriptors.length;
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.drawGlow({ x: 0.5, y: 0.5, radius: 0.1, color: { r: 4, g: 4, b: 4, a: 1 } });
+    renderer.endFrame();
+    // Back to the plain two-pass path (scene + post): exactly 2 passes added.
+    expect(harness.passDescriptors.length - before).toBe(2);
+  });
+
+  it("honours the decay: the feedback uniform carries the configured value, clamped below 1", async () => {
+    const { harness, renderer } = await makeReady();
+    // A distinctive in-range decay, plus a >1 decay that must clamp to <1.
+    renderer.setPostEffects({ feedback: { enabled: true, decay: 0.83 } });
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.endFrame();
+
+    const writes = decodeUniformWrites(harness.writeBuffer);
+    // The feedback uniform packs [decay, 0, 0, 0]; 0.83 round-trips through f32.
+    expect(writesContainVec(writes, [0.83, 0, 0, 0])).toBe(true);
+
+    // A decay of exactly 1 (or higher) clamps to the max (0.999) so trails fade.
+    renderer.setPostEffects({ feedback: { decay: 1 } });
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.endFrame();
+    const writes2 = decodeUniformWrites(harness.writeBuffer);
+    expect(writesContainVec(writes2, [0.999, 0, 0, 0])).toBe(true);
+    expect(writes2.some((w) => w[0] === 1 && w[1] === 0 && w[2] === 0 && w[3] === 0)).toBe(false);
+  });
+
+  it("allocates the ping-pong history textures and recreates them on resize", async () => {
+    const { harness, renderer } = await makeReady();
+    // Two full-res HDR history textures (64×64) exist alongside the scene HDR.
+    const sizesAt64 = harness.createTexture.mock.calls
+      .map((c) => (c[0] as { size: { width: number; height: number } }).size)
+      .filter((s) => s.width === 64 && s.height === 64);
+    // hdr(1) + history×2 = at least 3 full-res rgba16float allocations.
+    expect(sizesAt64.length).toBeGreaterThanOrEqual(3);
+
+    // Resize must NOT crash and reallocates history at the new size.
+    expect(() => renderer.resize(48, 48, 1)).not.toThrow();
+    const sizesAt48 = harness.createTexture.mock.calls
+      .map((c) => (c[0] as { size: { width: number; height: number } }).size)
+      .filter((s) => s.width === 48 && s.height === 48);
+    expect(sizesAt48.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("resetting after resize re-seeds history (no crash, first post-resize frame seeds)", async () => {
+    const { harness, renderer } = await makeReady();
+    renderer.setPostEffects({ feedback: { enabled: true, decay: 0.9 } });
+    // Prime once.
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.endFrame();
+    // Resize resets history (primed → false). The next frame must SEED again
+    // (one copy pass), not composite against stale/wrong-size history.
+    renderer.resize(80, 80, 1);
+    const before = harness.passDescriptors.length;
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.endFrame();
+    // scene(1) + seedCopy(1) + post(1) = 3 passes (the seed path again).
+    expect(harness.passDescriptors.length - before).toBe(3);
+  });
+
+  it("feedback is part of the backend-agnostic surface (no backend branch)", () => {
+    const drive = (r: Renderer): void => {
+      r.setPostEffects({ feedback: { enabled: true, decay: 0.9 } });
+    };
+    const src = drive.toString();
+    expect(src).not.toMatch(/webgpu|webgl|GPUDevice|WebGLRenderingContext|getContext|gl\./i);
+    expect(src).not.toMatch(/\.backend/);
+  });
+
+  it("webgl treats feedback as a no-op (basic look, never throws)", async () => {
+    const { canvas, gl } = makeFakeCanvas();
+    const renderer = createRenderer(canvas, { environment: { gpu: null, hasWebgl: () => true } });
+    await renderer.init();
+    renderer.resize(100, 100, 1);
+    expect(() => renderer.setPostEffects({ feedback: { enabled: true, decay: 0.95 } })).not.toThrow();
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.drawRect({ x: 0, y: 0, w: 0.5, h: 0.5, color: { r: 1, g: 0, b: 0, a: 1 } });
+    renderer.endFrame();
+    // Still rendering directly — feedback config ignored.
+    expect(gl.drawArrays).toHaveBeenCalled();
+  });
+
+  it("feedbackCombine is the pure recurrence scene + history*decay, decay clamped to [0,0.999]", () => {
+    expect(feedbackCombine(1, 0, 0.9)).toBe(1);
+    expect(feedbackCombine(0.2, 1, 0.9)).toBeCloseTo(1.1, 10);
+    // decay >= 1 clamps to 0.999 so the trail still fades.
+    expect(feedbackCombine(0, 1, 1)).toBeCloseTo(0.999, 10);
+    expect(feedbackCombine(0, 1, 2)).toBeCloseTo(0.999, 10);
+    // Negative / non-finite decay is rejected (0 / default 0.9 respectively).
+    expect(feedbackCombine(0, 1, -1)).toBe(0);
+    expect(feedbackCombine(0, 1, NaN)).toBeCloseTo(0.9, 10);
+  });
+
+  it("OFFLINE DETERMINISM: a multi-frame feedback sequence is byte-identical across two runs", () => {
+    // The story's determinism note: trails depend on frame history, but the
+    // feedback is a PURE function of prior frames + decay (no time, no RNG), so
+    // a fixed-fps offline render produces identical output across runs. We model
+    // a moving bright impulse (a glow stepping across frames) as a per-frame
+    // scene value and run the recurrence twice with identical inputs.
+    const decay = 0.9;
+    // A bright pulse on frames 2 and 5, dark otherwise — like a glow passing a
+    // sample point twice. The trail must accumulate + decay identically.
+    const sceneA = [0, 0, 1, 0, 0, 1, 0, 0, 0, 0];
+    const sceneB = [...sceneA]; // identical inputs, a second independent run
+
+    const run1 = feedbackSequence(sceneA, decay);
+    const run2 = feedbackSequence(sceneB, decay);
+
+    // Two runs with identical inputs are exactly equal (no drift).
+    expect(run2).toEqual(run1);
+    // And the trail is real: after the frame-2 pulse, frames 3 and 4 are lit by
+    // the DECAYED history even though their own scene value is 0 — a tail.
+    expect(run1[2]).toBe(1); // pulse frame
+    expect(run1[3]).toBeCloseTo(0.9, 10); // 1 * 0.9
+    expect(run1[4]).toBeCloseTo(0.81, 10); // 0.9 * 0.9
+    expect(run1[3]!).toBeGreaterThan(run1[4]!); // fades with distance
+    expect(run1[4]!).toBeGreaterThan(0); // still lit
+
+    // The second pulse (frame 5) lands ON TOP of the residual tail from frame 2,
+    // and the determinism still holds frame-for-frame.
+    expect(run1[5]).toBeCloseTo(1 + 0.81 * 0.9, 10);
+    for (let i = 0; i < run1.length; i++) {
+      expect(run2[i]).toBe(run1[i]);
+    }
+  });
+
+  it("OFFLINE DETERMINISM: decay 0 leaves NO trail (history contributes nothing)", () => {
+    const scene = [0, 1, 0, 0];
+    const out = feedbackSequence(scene, 0);
+    // With decay 0 each frame is exactly its own scene value — no tail.
+    expect(out).toEqual(scene);
   });
 });
 
