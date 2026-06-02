@@ -10,6 +10,7 @@ import { version as coreVersion, defaultPresetRegistry } from "@cymatic/core";
 import { geometricPresets, registerGeometricPresets } from "./geometric/index.js";
 import { colorfieldPresets, registerColorfieldPresets } from "./colorfield/index.js";
 import { generativePresets, registerGenerativePresets } from "./generative/index.js";
+import { particlePresets, registerParticlePresets } from "./particle/index.js";
 
 /** Semantic version of the @cymatic/presets package surface. */
 export const version = "0.0.0";
@@ -26,11 +27,15 @@ export * from "./colorfield/index.js";
 // The generative / algorithmic pack (flow fields, reaction-diffusion, plotter).
 export * from "./generative/index.js";
 
+// The particle / fluid / 3D pack (particle systems, advected dye, point cloud).
+export * from "./particle/index.js";
+
 /** Every preset definition shipped in this build, in display order. */
 export const allPresets = [
   ...geometricPresets,
   ...colorfieldPresets,
   ...generativePresets,
+  ...particlePresets,
 ] as const;
 
 /** Identifiers of presets shipped in this build. */
@@ -42,3 +47,4 @@ export const presetIds: readonly string[] = allPresets.map((p) => p.id);
 registerGeometricPresets(defaultPresetRegistry, { replace: true });
 registerColorfieldPresets(defaultPresetRegistry, { replace: true });
 registerGenerativePresets(defaultPresetRegistry, { replace: true });
+registerParticlePresets(defaultPresetRegistry, { replace: true });
