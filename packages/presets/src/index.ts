@@ -8,6 +8,7 @@
 import { version as coreVersion, defaultPresetRegistry } from "@cymatic/core";
 
 import { geometricPresets, registerGeometricPresets } from "./geometric/index.js";
+import { colorfieldPresets, registerColorfieldPresets } from "./colorfield/index.js";
 
 /** Semantic version of the @cymatic/presets package surface. */
 export const version = "0.0.0";
@@ -18,8 +19,11 @@ export const builtAgainstCore = coreVersion;
 // The geometric / Swiss / Bauhaus pack.
 export * from "./geometric/index.js";
 
+// The color-field / Rothko-adjacent pack (luminous gradient atmospheres).
+export * from "./colorfield/index.js";
+
 /** Every preset definition shipped in this build, in display order. */
-export const allPresets = [...geometricPresets] as const;
+export const allPresets = [...geometricPresets, ...colorfieldPresets] as const;
 
 /** Identifiers of presets shipped in this build. */
 export const presetIds: readonly string[] = allPresets.map((p) => p.id);
@@ -28,3 +32,4 @@ export const presetIds: readonly string[] = allPresets.map((p) => p.id);
 // of importing the package, so a host that imports @cymatic/presets can resolve
 // any shipped preset by id from `defaultPresetRegistry`.
 registerGeometricPresets(defaultPresetRegistry, { replace: true });
+registerColorfieldPresets(defaultPresetRegistry, { replace: true });
