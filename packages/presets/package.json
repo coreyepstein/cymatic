@@ -15,7 +15,7 @@
     }
   },
   "files": ["dist"],
-  "sideEffects": false,
+  "sideEffects": ["./dist/index.js"],
   "scripts": {
     "build": "tsc -b tsconfig.json",
     "typecheck": "tsc -b tsconfig.json",

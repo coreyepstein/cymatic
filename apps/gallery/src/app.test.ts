@@ -8,7 +8,11 @@ describe("gallery app", () => {
     expect(coreVersion).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
-  it("renders against an initially-empty preset catalog", () => {
-    expect(presetIds.length).toBe(0);
+  it("renders against the shipped preset catalog", () => {
+    // The presets package now ships a populated catalog (US-006+); every entry
+    // must be a non-empty id and ids must be unique.
+    expect(presetIds.length).toBeGreaterThan(0);
+    expect(presetIds.every((id) => id.length > 0)).toBe(true);
+    expect(new Set(presetIds).size).toBe(presetIds.length);
   });
 });

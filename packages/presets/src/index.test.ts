@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { builtAgainstCore, presetIds, version } from "./index.js";
+import { allPresets, builtAgainstCore, presetIds, version } from "./index.js";
 
 describe("@cymatic/presets", () => {
   it("exposes a semver-shaped version", () => {
@@ -11,7 +11,8 @@ describe("@cymatic/presets", () => {
     expect(builtAgainstCore).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
-  it("starts with an empty preset catalog", () => {
-    expect(presetIds).toEqual([]);
+  it("ships at least three presets with unique ids", () => {
+    expect(allPresets.length).toBeGreaterThanOrEqual(3);
+    expect(new Set(presetIds).size).toBe(presetIds.length);
   });
 });
