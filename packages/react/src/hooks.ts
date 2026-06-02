@@ -22,6 +22,7 @@ import {
   createRenderer,
   playBufferSource,
   toRgba,
+  ZERO_MOOD,
   type AnalyserOptions,
   type AudioFeatureFrame,
   type CreateRendererOptions,
@@ -116,6 +117,7 @@ function silentFrame(time: number): AudioFeatureFrame {
     tempo: 0,
     beatPhase: 0,
     onsetDensity: 0,
+    mood: ZERO_MOOD,
     time,
   };
 }

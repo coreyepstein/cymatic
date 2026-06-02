@@ -41,6 +41,45 @@ describe("AudioAnalyser.computeFrame", () => {
     expect(frame.tempo).toBe(0); // no onset history yet
     expect(frame.beatPhase).toBe(0);
     expect(frame.onsetDensity).toBeGreaterThanOrEqual(0);
+
+    // V2-06 mood vector: present and in range. Silent input -> low mood.
+    expect(frame.mood).toBeDefined();
+    for (const v of Object.values(frame.mood)) {
+      expect(v).toBeGreaterThanOrEqual(0);
+      expect(v).toBeLessThanOrEqual(1);
+    }
+    expect(frame.mood.energy).toBeLessThan(0.5);
+  });
+
+  it("mood rises for a loud, bright, busy signal vs near-silence", () => {
+    const analyser = new AudioAnalyser({ bandCount: 16, smoothing: 0 });
+
+    // Bright, high-energy spectrum + loud time-domain, with periodic spikes to
+    // drive onsets/density. Run several frames so the mood EMA can rise.
+    const bright = new Uint8Array(512).fill(180);
+    for (let i = 256; i < 512; i++) bright[i] = 255; // energy toward the highs
+    const spike = new Uint8Array(512).fill(255);
+    const loud = new Uint8Array(1024);
+    for (let i = 0; i < 1024; i++) {
+      loud[i] = 128 + Math.round(120 * Math.sin((2 * Math.PI * i) / 64));
+    }
+
+    let hot = analyser.computeFrame(bright, loud, 0);
+    for (let i = 1; i < 40; i++) {
+      const spectrum = i % 5 === 0 ? spike : bright;
+      hot = analyser.computeFrame(spectrum, loud, i * 0.1);
+    }
+
+    const quiet = new AudioAnalyser({ bandCount: 16, smoothing: 0 });
+    const dark = new Uint8Array(512).fill(2);
+    let cold = quiet.computeFrame(dark, silentTime(1024), 0);
+    for (let i = 1; i < 40; i++) {
+      cold = quiet.computeFrame(dark, silentTime(1024), i * 0.1);
+    }
+
+    expect(hot.mood.energy).toBeGreaterThan(cold.mood.energy);
+    expect(hot.mood.brightness).toBeGreaterThan(cold.mood.brightness);
+    expect(hot.mood.busyness).toBeGreaterThan(cold.mood.busyness);
   });
 
   it("exposes spectral flux after the first frame", () => {

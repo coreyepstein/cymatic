@@ -26,6 +26,12 @@ import {
   type AudioFeatureFrame,
   type BandSplit,
 } from "./features.js";
+import {
+  ZERO_MOOD,
+  computeMood,
+  type MoodOptions,
+  type MoodVector,
+} from "./mood.js";
 
 /** Configuration for {@link AudioAnalyser}. All fields optional. */
 export interface AnalyserOptions {
@@ -62,6 +68,11 @@ export interface AnalyserOptions {
    * does not jitter every frame. Higher = stickier. Default `0.9`.
    */
   tempoSmoothing?: number;
+  /**
+   * Tuning for the derived {@link MoodVector} (smoothing + normalization). See
+   * {@link MoodOptions}.
+   */
+  mood?: MoodOptions;
 }
 
 interface ResolvedOptions {
@@ -73,6 +84,7 @@ interface ResolvedOptions {
   loudnessLongSmoothing: number;
   tempoWindowSeconds: number;
   tempoSmoothing: number;
+  mood: MoodOptions;
 }
 
 const DEFAULTS: ResolvedOptions = {
@@ -84,6 +96,7 @@ const DEFAULTS: ResolvedOptions = {
   loudnessLongSmoothing: 0.95,
   tempoWindowSeconds: 4,
   tempoSmoothing: 0.9,
+  mood: {},
 };
 
 /**
@@ -111,6 +124,8 @@ export class AudioAnalyser {
   private prevTime: number | null = null;
   /** Rolling onset timestamps (seconds) within the tempo window. */
   private onsetTimes: number[] = [];
+  /** Smoothed high-level mood vector, carried across frames. */
+  private mood: MoodVector = { ...ZERO_MOOD };
 
   constructor(options: AnalyserOptions = {}) {
     this.opts = {
@@ -129,6 +144,7 @@ export class AudioAnalyser {
       tempoSmoothing: clamp01(
         options.tempoSmoothing ?? DEFAULTS.tempoSmoothing,
       ),
+      mood: options.mood ?? DEFAULTS.mood,
     };
     this.beatDetector = new BeatDetector(options.beat);
     this.smoothedBands = new Array<number>(this.opts.bandCount).fill(0);
@@ -154,6 +170,7 @@ export class AudioAnalyser {
     this.beatPhase = 0;
     this.prevTime = null;
     this.onsetTimes = [];
+    this.mood = { ...ZERO_MOOD };
     this.beatDetector.reset();
   }
 
@@ -278,7 +295,7 @@ export class AudioAnalyser {
     }
     this.prevTime = time;
 
-    return {
+    const frame: AudioFeatureFrame = {
       bands: this.smoothedBands.slice(),
       bass: groups.bass,
       mid: groups.mid,
@@ -294,7 +311,14 @@ export class AudioAnalyser {
       tempo: this.lockedTempo,
       beatPhase: this.beatPhase,
       onsetDensity,
+      mood: ZERO_MOOD,
       time,
     };
+
+    // Derive the high-level mood from the raw frame, smoothing across frames.
+    this.mood = computeMood(frame, this.mood, this.opts.mood);
+    frame.mood = this.mood;
+
+    return frame;
   }
 }

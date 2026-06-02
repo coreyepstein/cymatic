@@ -69,6 +69,13 @@ export interface AudioFeatureFrame {
   beatPhase: number;
   /** Detected onsets per second, averaged over a rolling window. >= 0. */
   onsetDensity: number;
+  /**
+   * Smoothed, high-level read of the musical *feel* derived from the raw
+   * features above (energy / brightness / busyness / valence / dynamics, each
+   * in [0, 1]). See {@link MoodVector}. `valence` is an approximate heuristic
+   * proxy, not true musical valence.
+   */
+  mood: import("./mood.js").MoodVector;
   /** Timestamp for the frame, in seconds. */
   time: number;
 }

@@ -20,6 +20,7 @@ function frame(overrides: Partial<AudioFeatureFrame> = {}): AudioFeatureFrame {
     tempo: 0,
     beatPhase: 0,
     onsetDensity: 0,
+    mood: { energy: 0, brightness: 0, busyness: 0, valence: 0, dynamics: 0 },
     time: 0,
     ...overrides,
   };
