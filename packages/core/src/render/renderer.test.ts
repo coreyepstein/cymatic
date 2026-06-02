@@ -220,14 +220,20 @@ describe("preset-facing call path is backend-agnostic", () => {
   it("drives a webgpu backend through the SAME smoke scene path", async () => {
     const harness = makeWebgpuHarness();
     const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
-    // EXACT same preset path as the webgl case.
-    await runSmokePreset(renderer);
+    await renderer.init();
+    // Disable the cinematic bloom/vignette for THIS test so the frame is the
+    // minimal two-pass path (scene→offscreen, then post→swapchain). The bloom
+    // chain's extra passes are exercised by the V2-02 suite below.
+    renderer.setPostEffects({ bloom: { enabled: false }, vignette: { enabled: false } });
+    renderer.resize(640, 480, 2);
+    const scene: Scene = { background: toRgba({ r: 0.1, g: 0.2, b: 0.3, a: 1 }) };
+    renderer.render(scene, { level: 0.5, bands: [0.1, 0.2] }, 0);
 
     expect(harness.canvas.width).toBe(1280);
     expect(harness.canvas.height).toBe(960);
-    // The v2 framework routes the frame through an offscreen HDR target: every
-    // frame is TWO passes (scene→offscreen, then post/composite→swapchain) and
-    // a single submit batching both.
+    // The v2 framework routes the frame through an offscreen HDR target: with
+    // bloom off the frame is TWO passes (scene→offscreen, then
+    // post/composite→swapchain) and a single submit batching both.
     expect(harness.submit).toHaveBeenCalledTimes(1);
     expect(harness.passDescriptors).toHaveLength(2);
     // PASS 1 (scene) clears the offscreen HDR target to the background.
@@ -239,12 +245,9 @@ describe("preset-facing call path is backend-agnostic", () => {
     };
     expect(sceneDesc.colorAttachments[0]?.loadOp).toBe("clear");
     expect(sceneDesc.colorAttachments[0]?.clearValue).toEqual({ r: 0.1, g: 0.2, b: 0.3, a: 1 });
-    // Two pipelines are built once in init() (scene + post) and both bound.
-    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(2);
-    // Scene pipeline bound in pass 1, post pipeline bound in pass 2.
-    expect(harness.setPipeline).toHaveBeenCalledTimes(2);
-    // The post pass binds the composite bind group (HDR texture + sampler + params).
-    expect(harness.setBindGroup).toHaveBeenCalledTimes(1);
+    // Five pipelines are built once in init() (scene + bright + blur + upsample
+    // + post). With bloom off only the scene + post are BOUND this frame.
+    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(5);
     // The offscreen HDR target is allocated as an rgba16float texture.
     expect(harness.createTexture).toHaveBeenCalled();
     const texDesc = harness.createTexture.mock.calls[0]?.[0] as { format: string };
@@ -405,6 +408,8 @@ describe("drawRect primitive (backend-agnostic)", () => {
     const harness = makeWebgpuHarness();
     const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
     await renderer.init();
+    // Bloom off so the frame is the minimal two-pass path for this assertion.
+    renderer.setPostEffects({ bloom: { enabled: false } });
     renderer.resize(100, 100, 2); // 200x200
 
     renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
@@ -437,6 +442,7 @@ describe("drawRect primitive (backend-agnostic)", () => {
     const harness = makeWebgpuHarness();
     const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
     await renderer.init();
+    renderer.setPostEffects({ bloom: { enabled: false } });
     renderer.resize(100, 100, 1);
 
     renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
@@ -450,10 +456,11 @@ describe("drawRect primitive (backend-agnostic)", () => {
     expect(harness.drawsByPass[1]).toEqual([[3, 1]]);
   });
 
-  it("webgpu builds the scene + post pipelines exactly once across frames", async () => {
+  it("webgpu builds the scene + bloom + post pipelines exactly once across frames", async () => {
     const harness = makeWebgpuHarness();
     const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
     await renderer.init();
+    renderer.setPostEffects({ bloom: { enabled: false } });
     renderer.resize(100, 100, 1);
 
     for (let frame = 0; frame < 3; frame++) {
@@ -462,10 +469,11 @@ describe("drawRect primitive (backend-agnostic)", () => {
       renderer.endFrame();
     }
 
-    // Two pipelines (scene + post), two shader modules — built once in init().
-    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(2);
-    expect(harness.createShaderModule).toHaveBeenCalledTimes(2);
-    // Two passes per frame (scene + post) => 6 across 3 frames.
+    // Five pipelines (scene + bright + blur + upsample + post), five shader
+    // modules — all built once in init().
+    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(5);
+    expect(harness.createShaderModule).toHaveBeenCalledTimes(5);
+    // With bloom off, two passes per frame (scene + post) => 6 across 3 frames.
     expect(harness.passDescriptors).toHaveLength(6);
     // Each frame: instanced scene draw then fullscreen post draw.
     expect(harness.drawCalls).toEqual([
@@ -486,6 +494,8 @@ describe("HDR offscreen target + post-processing framework (V2-01)", () => {
     const harness = makeWebgpuHarness();
     const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
     await renderer.init();
+    // Bloom off so the substrate's minimal two-pass shape holds for this test.
+    renderer.setPostEffects({ bloom: { enabled: false } });
     renderer.resize(64, 48, 1);
 
     renderer.beginFrame({ r: 0.02, g: 0.02, b: 0.05, a: 1 });
@@ -494,15 +504,14 @@ describe("HDR offscreen target + post-processing framework (V2-01)", () => {
 
     // Two passes total.
     expect(harness.passDescriptors).toHaveLength(2);
-    // The offscreen HDR target is an rgba16float texture, usable as both render
-    // attachment and sampled texture.
+    // The offscreen HDR target is an rgba16float texture sized to the backing
+    // store, usable as both render attachment and sampled texture. (The bloom
+    // mip chain allocates further rgba16float textures at smaller sizes.)
     expect(harness.createTexture).toHaveBeenCalled();
-    const texDesc = harness.createTexture.mock.calls.at(-1)?.[0] as {
-      format: string;
-      size: { width: number; height: number };
-    };
-    expect(texDesc.format).toBe("rgba16float");
-    expect(texDesc.size).toEqual({ width: 64, height: 48 });
+    const fullSize = harness.createTexture.mock.calls
+      .map((c) => c[0] as { format: string; size: { width: number; height: number } })
+      .find((d) => d.size.width === 64 && d.size.height === 48);
+    expect(fullSize?.format).toBe("rgba16float");
     // The post pass binds the composite bind group (HDR texture + sampler + params).
     expect(harness.setBindGroup).toHaveBeenCalledTimes(1);
     expect(harness.createSampler).toHaveBeenCalled();
@@ -520,13 +529,16 @@ describe("HDR offscreen target + post-processing framework (V2-01)", () => {
     renderer.resize(100, 100, 1); // 100x100
     renderer.resize(50, 50, 1); // 50x50
 
-    // The most recent texture is sized to the latest backing store.
-    const last = harness.createTexture.mock.calls.at(-1)?.[0] as {
-      size: { width: number; height: number };
-    };
-    expect(last.size).toEqual({ width: 50, height: 50 });
-    // More than one texture was allocated (one per resize), and the prior one
-    // was destroyed (no leak).
+    // After the latest resize a full-res HDR target sized to the new backing
+    // store was allocated. (Each resize also rebuilds the smaller bloom mips.)
+    const sizes = harness.createTexture.mock.calls.map(
+      (c) => (c[0] as { size: { width: number; height: number } }).size,
+    );
+    expect(sizes).toContainEqual({ width: 50, height: 50 });
+    // The first resize's full-res target (100x100) was also allocated earlier.
+    expect(sizes).toContainEqual({ width: 100, height: 100 });
+    // Many textures allocated (HDR + bloom mips, recreated per resize), and the
+    // prior generation was destroyed (no leak).
     expect(harness.createTexture.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
@@ -599,9 +611,16 @@ describe("HDR offscreen target + post-processing framework (V2-01)", () => {
     await renderer.init();
     renderer.resize(100, 100, 1);
 
-    // Must accept the call without throwing and without altering its direct
-    // render path: a subsequent frame still clears + scissors as before.
-    expect(() => renderer.setPostEffects({ exposure: 3 })).not.toThrow();
+    // Must accept the call (including bloom + vignette) without throwing and
+    // without altering its direct render path: a subsequent frame still clears
+    // + scissors as before. WebGL keeps its basic look — post-FX is a no-op.
+    expect(() =>
+      renderer.setPostEffects({
+        exposure: 3,
+        bloom: { enabled: true, threshold: 0.5, intensity: 1, radius: 2 },
+        vignette: { enabled: true, amount: 0.5 },
+      }),
+    ).not.toThrow();
 
     renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
     renderer.drawRect({ x: 0, y: 0, w: 0.5, h: 0.5, color: { r: 1, g: 0, b: 0, a: 1 } });
@@ -619,5 +638,166 @@ describe("HDR offscreen target + post-processing framework (V2-01)", () => {
     const src = drivePostFx.toString();
     expect(src).not.toMatch(/webgpu|webgl|GPUDevice|WebGLRenderingContext|getContext|gl\./i);
     expect(src).not.toMatch(/\.backend/);
+  });
+});
+
+/** Decode every writeBuffer call's payload as a Float32Array of its 4 floats. */
+function decodeUniformWrites(
+  writeBuffer: ReturnType<typeof vi.fn>,
+): number[][] {
+  return writeBuffer.mock.calls.map((c) => {
+    const data = c[2] as ArrayBufferLike | ArrayBufferView;
+    const view =
+      data instanceof ArrayBuffer
+        ? new Float32Array(data)
+        : new Float32Array(
+            (data as ArrayBufferView).buffer,
+            (data as ArrayBufferView).byteOffset,
+            4,
+          );
+    return Array.from(view.slice(0, 4));
+  });
+}
+
+/**
+ * True when some recorded 4-float write matches `expected` within float32
+ * rounding (the values round-trip through a `Float32Array` on upload, so e.g.
+ * 0.7 reads back as 0.69999998…). Tolerance is generous but far tighter than
+ * the gaps between the distinctive test values.
+ */
+function writesContainVec(writes: number[][], expected: number[]): boolean {
+  const eps = 1e-5;
+  return writes.some(
+    (w) =>
+      w.length === expected.length &&
+      w.every((v, i) => Math.abs(v - expected[i]!) < eps),
+  );
+}
+
+describe("bloom + vignette post-FX (V2-02)", () => {
+  it("enabling bloom adds the expected extra passes vs bloom-off", async () => {
+    // With bloom OFF the frame is two passes (scene + post). Enabling bloom adds
+    // the bright-pass, per-mip separable blur (H+V), downsamples, and an
+    // upsample-accumulate — strictly MORE passes — proving the bloom chain runs.
+    const offHarness = makeWebgpuHarness();
+    const off = createRenderer(offHarness.canvas, { backend: "webgpu", gpu: offHarness.gpu });
+    await off.init();
+    off.setPostEffects({ bloom: { enabled: false } });
+    off.resize(64, 64, 1);
+    off.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    off.drawRect({ x: 0.25, y: 0.25, w: 0.5, h: 0.5, color: { r: 4, g: 4, b: 4, a: 1 } });
+    off.endFrame();
+
+    const onHarness = makeWebgpuHarness();
+    const on = createRenderer(onHarness.canvas, { backend: "webgpu", gpu: onHarness.gpu });
+    await on.init();
+    on.setPostEffects({ bloom: { enabled: true } });
+    on.resize(64, 64, 1);
+    on.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    on.drawRect({ x: 0.25, y: 0.25, w: 0.5, h: 0.5, color: { r: 4, g: 4, b: 4, a: 1 } });
+    on.endFrame();
+
+    // Bloom-off is exactly the two-pass substrate.
+    expect(offHarness.passDescriptors).toHaveLength(2);
+    // Bloom-on runs strictly more passes (bright + blur + downsample + upsample
+    // + scene + post). With 4 mips: scene(1) + bright(1) + blur H/V ×4 (8) +
+    // downsample ×3 (3) + upsample-accumulate ×3 (3) + post(1) = 17.
+    expect(onHarness.passDescriptors.length).toBeGreaterThan(
+      offHarness.passDescriptors.length,
+    );
+    expect(onHarness.passDescriptors).toHaveLength(17);
+    // The bright-pass + every blur/upsample is a fullscreen-triangle draw(3,1);
+    // the scene pass draws the instanced quad once. So bloom-on has many more
+    // draw calls than bloom-off (which has just scene + post = 2 draws).
+    expect(onHarness.drawCalls.length).toBeGreaterThan(offHarness.drawCalls.length);
+    // First pass is always the scene clear; last pass is the swapchain composite.
+    const lastOn = onHarness.passDescriptors.at(-1) as {
+      colorAttachments: Array<{ loadOp: string }>;
+    };
+    expect(lastOn.colorAttachments[0]?.loadOp).toBe("clear");
+    // Still a single submit batching the whole chain.
+    expect(onHarness.submit).toHaveBeenCalledTimes(1);
+  });
+
+  it("builds five pipelines (scene + bright + blur + upsample + post) once", async () => {
+    const harness = makeWebgpuHarness();
+    const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
+    await renderer.init();
+    renderer.resize(64, 64, 1);
+    // The bloom stage needs four dedicated pipelines beyond the scene + post
+    // pipelines; all are built exactly once in init().
+    expect(harness.createRenderPipeline).toHaveBeenCalledTimes(5);
+    expect(harness.createShaderModule).toHaveBeenCalledTimes(5);
+  });
+
+  it("honours bloom + vignette config: the composite uniform records the values", async () => {
+    const harness = makeWebgpuHarness();
+    const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
+    await renderer.init();
+    renderer.resize(32, 32, 1);
+
+    // Distinctive, in-range values so the composite uniform vector is uniquely
+    // identifiable: [exposure, bloomIntensity, vignetteEnabled(=1), amount].
+    renderer.setPostEffects({
+      exposure: 1.3,
+      bloom: { enabled: true, threshold: 0.8, intensity: 0.42, radius: 1.5 },
+      vignette: { enabled: true, amount: 0.27 },
+    });
+
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.endFrame();
+
+    const writes = decodeUniformWrites(harness.writeBuffer);
+    // The composite params are uploaded verbatim (intensity honored because
+    // bloom is enabled; vignette enabled flag = 1; amount preserved).
+    expect(writesContainVec(writes, [1.3, 0.42, 1, 0.27])).toBe(true);
+    // The bloom uniform carries the configured threshold + radius across its
+    // bright-pass / blur invocations (dir flips between H and V).
+    expect(writesContainVec(writes, [0.8, 0, 0, 1.5])).toBe(true); // bright-pass
+    expect(writesContainVec(writes, [0.8, 1, 0, 1.5])).toBe(true); // horizontal blur
+    expect(writesContainVec(writes, [0.8, 0, 1, 1.5])).toBe(true); // vertical blur
+  });
+
+  it("disabling bloom zeroes the composite bloom intensity", async () => {
+    const harness = makeWebgpuHarness();
+    const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
+    await renderer.init();
+    renderer.resize(32, 32, 1);
+
+    renderer.setPostEffects({
+      exposure: 1,
+      bloom: { enabled: false, intensity: 0.9 },
+      vignette: { enabled: false, amount: 0.3 },
+    });
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.endFrame();
+
+    const writes = decodeUniformWrites(harness.writeBuffer);
+    // bloomIntensity forced to 0 (slot 1) and vignette disabled (slot 2 = 0)
+    // even though an amount was supplied — the effect is gated by `enabled`.
+    expect(writesContainVec(writes, [1, 0, 0, 0.3])).toBe(true);
+    // With bloom off, NO bloom-direction uniform writes happen at all.
+    expect(writes.some((w) => w[1] === 1 && w[2] === 0)).toBe(false); // no H blur
+    expect(writes.some((w) => w[1] === 0 && w[2] === 1)).toBe(false); // no V blur
+  });
+
+  it("clamps a negative bloom intensity / out-of-range vignette amount", async () => {
+    const harness = makeWebgpuHarness();
+    const renderer = createRenderer(harness.canvas, { backend: "webgpu", gpu: harness.gpu });
+    await renderer.init();
+    renderer.resize(32, 32, 1);
+
+    // Negative intensity clamps to the cinematic default (0.6); a >1 vignette
+    // amount clamps to 1.
+    renderer.setPostEffects({
+      exposure: 1,
+      bloom: { enabled: true, intensity: -3 },
+      vignette: { enabled: true, amount: 5 },
+    });
+    renderer.beginFrame({ r: 0, g: 0, b: 0, a: 1 });
+    renderer.endFrame();
+
+    const writes = decodeUniformWrites(harness.writeBuffer);
+    expect(writesContainVec(writes, [1, 0.6, 1, 1])).toBe(true);
   });
 });

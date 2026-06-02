@@ -91,6 +91,50 @@ export interface PostEffectsConfig {
    * a non-negative finite value by the backend.
    */
   exposure?: number;
+  /**
+   * Bloom: a bright-pass + separable Gaussian blur on a downsampled mip chain,
+   * composited additively back over the HDR scene before tonemap. This is what
+   * makes bright / audio-hot regions glow. Reads the HDR (`rgba16float`) target
+   * so highlights above `threshold` bleed. WebGPU honours this; WebGL no-ops.
+   */
+  bloom?: BloomConfig;
+  /**
+   * Vignette: a subtle darkening toward the frame edges, applied in the final
+   * composite/tonemap pass. WebGPU honours this; WebGL no-ops.
+   */
+  vignette?: VignetteConfig;
+}
+
+/** Bloom-stage configuration. All fields optional; merged onto current state. */
+export interface BloomConfig {
+  /** Whether the bloom stage runs at all. */
+  enabled?: boolean;
+  /**
+   * Luminance threshold for the bright-pass: only scene luminance above this
+   * contributes to bloom. Clamped to `>= 0` by the backend. ~0.7 is cinematic.
+   */
+  threshold?: number;
+  /**
+   * How strongly the blurred bloom is added back over the scene. Clamped to
+   * `>= 0`. ~0.6 is a tasteful default.
+   */
+  intensity?: number;
+  /**
+   * Blur spread multiplier applied to the per-mip Gaussian sample step. `1.0`
+   * is the natural mip-scaled radius; higher widens the glow. Clamped to `>= 0`.
+   */
+  radius?: number;
+}
+
+/** Vignette-stage configuration. All fields optional; merged onto current state. */
+export interface VignetteConfig {
+  /** Whether the vignette darkening runs at all. */
+  enabled?: boolean;
+  /**
+   * How strongly the edges are darkened, in `[0, 1]`. `0` is no darkening; the
+   * backend clamps out-of-range values. ~0.35 is a subtle cinematic default.
+   */
+  amount?: number;
 }
 
 /**

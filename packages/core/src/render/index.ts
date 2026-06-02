@@ -26,6 +26,8 @@ export type {
   RenderCanvasLike,
   CreateRendererOptions,
   PostEffectsConfig,
+  BloomConfig,
+  VignetteConfig,
 } from "./renderer.js";
 export { createRenderer, computeDrawingBufferSize, toRgba } from "./renderer.js";
 

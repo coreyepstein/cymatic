@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>cymatic · bloom harness</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #000;
+      }
+      #stage {
+        width: 256px;
+        height: 256px;
+      }
+      canvas {
+        display: block;
+        width: 256px;
+        height: 256px;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      Minimal V2-02 bloom verification harness. It drives the @cymatic/core
+      renderer DIRECTLY (no presets, no React) so a Playwright spec can render
+      one bright rect with bloom OFF vs ON and compare real GPU pixels. The page
+      exposes `window.__bloomHarness` once ready.
+    -->
+    <div id="stage"><canvas id="c" width="256" height="256"></canvas></div>
+    <script type="module" src="/src/bloom-harness.ts"></script>
+  </body>
+</html>

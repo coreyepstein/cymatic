@@ -1,31 +1,36 @@
 /**
  * WebGPU implementation of the backend-agnostic {@link Renderer}, with an
- * HDR offscreen render target + post-processing framework (cymatic v2).
+ * HDR offscreen render target + post-processing chain (cymatic v2 cinematic).
  *
  * Browser-only: it requests an adapter + device from `navigator.gpu`, configures
- * the canvas's `webgpu` context, and builds — once, in {@link init} — two
- * pipelines:
+ * the canvas's `webgpu` context, and builds — once, in {@link init} — the
+ * pipelines for the post chain:
  *
- *   1. The SCENE pipeline: the existing instanced colored-quad pipeline, but its
- *      fragment target is now an offscreen `rgba16float` HDR texture sized to the
- *      drawing buffer, NOT the swapchain. Each frame the scene pass clears that
- *      HDR texture to the background and issues one instanced `draw(6, rects)`.
+ *   1. The SCENE pipeline: the instanced colored-quad pipeline whose fragment
+ *      target is an offscreen `rgba16float` HDR texture sized to the drawing
+ *      buffer. Each frame the scene pass clears that HDR texture to the
+ *      background and issues one instanced `draw(6, rects)`.
  *
- *   2. The POST pipeline: a fullscreen pass that samples the HDR texture with a
- *      single fullscreen triangle (no vertex buffer), applies exposure +
- *      tonemap (ACES approximation), and writes to `context.getCurrentTexture()`
- *      (the swapchain). This is the composite/present stage.
+ *   2. The BLOOM pipelines (V2-02): a bright-pass that reads the HDR scene and
+ *      keeps only luminance above a threshold, written into a DOWNSAMPLED mip
+ *      chain (2–4 half-res-per-level textures), then a separable Gaussian blur
+ *      (horizontal + vertical, ping-pong per mip), and an upsample-accumulate
+ *      that folds the smaller mips back up into the largest. The result is the
+ *      blurred glow that the composite adds additively over the scene before
+ *      tonemap.
  *
- * So every frame runs TWO render passes — scene→offscreen, then post→swapchain.
- * This indirection is the substrate every later cinematic effect (bloom, trails)
- * plugs into: more stages slot between the scene pass and the final composite.
- * Presets never see any of this — they target {@link Renderer}.
+ *   3. The POST pipeline: a fullscreen pass that samples the HDR texture AND the
+ *      bloom texture, adds `bloom * intensity`, applies exposure + an ACES
+ *      tonemap, then a vignette darkening toward the edges, and writes to the
+ *      swapchain. This is the composite/present stage.
+ *
+ * So every frame runs the scene pass, then (when bloom is enabled) the bloom
+ * passes, then the final composite. Presets never see any of this — they target
+ * {@link Renderer} and drive the chain only through {@link setPostEffects}.
  *
  * Why instanced quads and not a scissored clear: in WebGPU `loadOp: "clear"`
  * clears the ENTIRE attachment and `setScissorRect` constrains only draw/blit
- * ops, not the load-clear. A per-rect "scissored clear" therefore repaints the
- * whole canvas to each rect's color, leaving only the last fill — a blank frame.
- * A real draw pipeline is the correct (and standard) way to fill rects.
+ * ops, not the load-clear. A real draw pipeline is the correct way to fill rects.
  *
  * We model only the slivers of the WebGPU API we touch via small structural
  * interfaces, so the package needs no `@webgpu/types` dependency.
@@ -34,6 +39,7 @@
 import type { GpuLike, RendererBackend } from "../capabilities.js";
 import {
   computeDrawingBufferSize,
+  type BloomConfig,
   type DrawingBufferSize,
   type NormalizedRect,
   type PostEffectsConfig,
@@ -41,6 +47,7 @@ import {
   type Renderer,
   type RgbaColor,
   type Scene,
+  type VignetteConfig,
 } from "../renderer.js";
 
 /**
@@ -59,9 +66,9 @@ const BUFFER_USAGE = {
 } as const;
 
 /**
- * `GPUTextureUsage` bit flags we rely on for the offscreen HDR target: it is
- * both a render attachment (the scene pass draws into it) and a sampled texture
- * (the post pass reads it).
+ * `GPUTextureUsage` bit flags we rely on for the offscreen HDR / bloom targets:
+ * each is both a render attachment (a pass draws into it) and a sampled texture
+ * (a later pass reads it).
  */
 const TEXTURE_USAGE = {
   /** Usable as a color attachment. */
@@ -70,14 +77,36 @@ const TEXTURE_USAGE = {
   TEXTURE_BINDING: 0x04,
 } as const;
 
-/** The HDR format for the offscreen scene target. */
+/** The HDR format for the offscreen scene + bloom targets. */
 const HDR_FORMAT = "rgba16float";
 
 /** Default exposure for the tonemap stage. */
 const DEFAULT_EXPOSURE = 1;
 
-/** Bytes in the post-FX uniform buffer: a single f32 (exposure), padded to 16. */
+/** Cinematic bloom defaults. */
+const DEFAULT_BLOOM_ENABLED = true;
+const DEFAULT_BLOOM_THRESHOLD = 0.7;
+const DEFAULT_BLOOM_INTENSITY = 0.6;
+const DEFAULT_BLOOM_RADIUS = 1;
+
+/** Cinematic vignette defaults. */
+const DEFAULT_VIGNETTE_ENABLED = true;
+const DEFAULT_VIGNETTE_AMOUNT = 0.35;
+
+/** Number of downsampled bloom mip levels (clamped 2–4 of the design range). */
+const BLOOM_MIP_LEVELS = 4;
+
+/**
+ * Bytes in the COMPOSITE uniform buffer: exposure, bloomIntensity, vignette
+ * enabled flag, vignette amount → 4 × f32 = 16 bytes (one std140 vec4 slot).
+ */
 const POST_UNIFORM_BYTES = 16;
+
+/**
+ * Bytes in the BLOOM uniform buffer: threshold, dirX, dirY, radius → 4 × f32 =
+ * 16 bytes. Re-uploaded each blur invocation (cheap) to set the blur direction.
+ */
+const BLOOM_UNIFORM_BYTES = 16;
 
 /** Structural subset of `GPUBuffer`. */
 interface GpuBufferLike {
@@ -193,9 +222,15 @@ interface GpuRenderPipelineDescriptorLike {
   fragment: {
     module: GpuShaderModuleLike;
     entryPoint: string;
-    targets: Array<{ format: string }>;
+    targets: Array<{ format: string; blend?: GpuBlendStateLike }>;
   };
   primitive: { topology: string };
+}
+
+/** A blend state (used to make the upsample pass additive). */
+interface GpuBlendStateLike {
+  color: { srcFactor: string; dstFactor: string; operation?: string };
+  alpha: { srcFactor: string; dstFactor: string; operation?: string };
 }
 
 interface GpuAdapterLike {
@@ -260,10 +295,6 @@ const BYTES_PER_INSTANCE = FLOATS_PER_INSTANCE * 4;
  * from `vertex_index` (two triangles, 6 vertices) with no vertex buffer; the
  * per-instance buffer carries `[x, y, w, h]` (a NormalizedRect: top-left origin,
  * y down, range [0,1]) and `[r, g, b, a]`. It targets the HDR offscreen texture.
- *
- * Map a unit-quad coord (u, v) in [0,1] into clip space:
- *   clipX = (x + u*w) * 2 - 1
- *   clipY = 1 - (y + v*h) * 2   // flip y: normalized y runs top→bottom
  */
 const QUAD_SHADER = /* wgsl */ `
 struct VsOut {
@@ -277,7 +308,6 @@ fn vs_main(
   @location(0) rect : vec4<f32>,   // x, y, w, h
   @location(1) color : vec4<f32>,  // r, g, b, a
 ) -> VsOut {
-  // Unit-quad corners (u, v) in [0,1] for two triangles.
   var corners = array<vec2<f32>, 6>(
     vec2<f32>(0.0, 0.0),
     vec2<f32>(1.0, 0.0),
@@ -304,35 +334,17 @@ fn fs_main(in : VsOut) -> @location(0) vec4<f32> {
 `;
 
 /**
- * WGSL for the POST / composite pass. A single fullscreen triangle covers the
- * viewport (no vertex buffer); the fragment samples the HDR scene texture,
- * applies exposure, then an ACES-approximation tonemap, and writes to the
- * swapchain. The exposure scalar comes from a uniform buffer (binding 0); the
- * scene texture is binding 1 and its sampler binding 2.
- *
- * This is where later cinematic stages compose: bloom/vignette become extra
- * sampled textures + math before the final tonemap.
+ * Shared fullscreen-triangle vertex stage used by every post pass. A single
+ * oversized triangle covers the viewport (no vertex buffer) and emits UVs.
  */
-const POST_SHADER = /* wgsl */ `
-struct Params {
-  exposure : f32,
-  _pad0 : f32,
-  _pad1 : f32,
-  _pad2 : f32,
-};
-
-@group(0) @binding(0) var<uniform> params : Params;
-@group(0) @binding(1) var sceneTex : texture_2d<f32>;
-@group(0) @binding(2) var sceneSampler : sampler;
-
+const FULLSCREEN_VS = /* wgsl */ `
 struct VsOut {
   @builtin(position) pos : vec4<f32>,
   @location(0) uv : vec2<f32>,
 };
 
 @vertex
-fn vs_post(@builtin(vertex_index) vi : u32) -> VsOut {
-  // Oversized fullscreen triangle: clip-space corners and matching UVs.
+fn vs_fullscreen(@builtin(vertex_index) vi : u32) -> VsOut {
   var positions = array<vec2<f32>, 3>(
     vec2<f32>(-1.0, -1.0),
     vec2<f32>( 3.0, -1.0),
@@ -348,6 +360,115 @@ fn vs_post(@builtin(vertex_index) vi : u32) -> VsOut {
   out.uv = uvs[vi];
   return out;
 }
+`;
+
+/**
+ * WGSL for the BRIGHT-PASS: read the HDR scene, keep only the portion of each
+ * channel whose luminance is above `threshold`, scaled by how far over it is.
+ * Writes into the (downsampled) first bloom mip. binding 0 = bloom params
+ * uniform (threshold in `.x`), 1 = HDR scene texture, 2 = sampler.
+ */
+const BRIGHT_PASS_SHADER = /* wgsl */ `
+${FULLSCREEN_VS}
+
+struct BloomParams {
+  threshold : f32,
+  dirX : f32,
+  dirY : f32,
+  radius : f32,
+};
+
+@group(0) @binding(0) var<uniform> params : BloomParams;
+@group(0) @binding(1) var srcTex : texture_2d<f32>;
+@group(0) @binding(2) var srcSampler : sampler;
+
+@fragment
+fn fs_bright(in : VsOut) -> @location(0) vec4<f32> {
+  let c = textureSample(srcTex, srcSampler, in.uv).rgb;
+  let lum = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+  // Soft knee around the threshold so the bright-pass doesn't hard-clip.
+  let over = max(lum - params.threshold, 0.0);
+  let weight = over / max(lum, 1.0e-4);
+  return vec4<f32>(c * weight, 1.0);
+}
+`;
+
+/**
+ * WGSL for the separable Gaussian BLUR. Direction comes from the bloom uniform
+ * (`dirX`, `dirY`) scaled by `radius`; the texel step is derived from the source
+ * texture dimensions so each mip blurs at its own resolution. 9-tap kernel.
+ * binding 0 = bloom params uniform, 1 = source texture, 2 = sampler.
+ */
+const BLUR_SHADER = /* wgsl */ `
+${FULLSCREEN_VS}
+
+struct BloomParams {
+  threshold : f32,
+  dirX : f32,
+  dirY : f32,
+  radius : f32,
+};
+
+@group(0) @binding(0) var<uniform> params : BloomParams;
+@group(0) @binding(1) var srcTex : texture_2d<f32>;
+@group(0) @binding(2) var srcSampler : sampler;
+
+@fragment
+fn fs_blur(in : VsOut) -> @location(0) vec4<f32> {
+  let dims = vec2<f32>(textureDimensions(srcTex, 0));
+  let texel = vec2<f32>(1.0, 1.0) / dims;
+  let dir = vec2<f32>(params.dirX, params.dirY) * texel * max(params.radius, 0.0);
+
+  // Normalized 9-tap Gaussian weights.
+  var w = array<f32, 5>(0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
+  var acc = textureSample(srcTex, srcSampler, in.uv).rgb * w[0];
+  for (var i : i32 = 1; i < 5; i = i + 1) {
+    let o = dir * f32(i);
+    acc = acc + textureSample(srcTex, srcSampler, in.uv + o).rgb * w[i];
+    acc = acc + textureSample(srcTex, srcSampler, in.uv - o).rgb * w[i];
+  }
+  return vec4<f32>(acc, 1.0);
+}
+`;
+
+/**
+ * WGSL for the UPSAMPLE pass: sample a smaller (already-blurred) mip and write
+ * it into the next-larger mip with ADDITIVE blending (set on the pipeline) so
+ * the chain accumulates a wide, soft glow. A plain bilinear sample widens the
+ * footprint for free at the lower resolution. binding 0 = source, 1 = sampler.
+ */
+const UPSAMPLE_SHADER = /* wgsl */ `
+${FULLSCREEN_VS}
+
+@group(0) @binding(0) var srcTex : texture_2d<f32>;
+@group(0) @binding(1) var srcSampler : sampler;
+
+@fragment
+fn fs_upsample(in : VsOut) -> @location(0) vec4<f32> {
+  return vec4<f32>(textureSample(srcTex, srcSampler, in.uv).rgb, 1.0);
+}
+`;
+
+/**
+ * WGSL for the POST / COMPOSITE pass. Samples the HDR scene AND the (largest)
+ * bloom mip, adds `bloom * bloomIntensity`, applies exposure + ACES tonemap,
+ * then a radial vignette darkening. Writes to the swapchain. binding 0 = post
+ * params uniform, 1 = HDR scene, 2 = sampler, 3 = bloom texture.
+ */
+const POST_SHADER = /* wgsl */ `
+${FULLSCREEN_VS}
+
+struct Params {
+  exposure : f32,
+  bloomIntensity : f32,
+  vignetteEnabled : f32,
+  vignetteAmount : f32,
+};
+
+@group(0) @binding(0) var<uniform> params : Params;
+@group(0) @binding(1) var sceneTex : texture_2d<f32>;
+@group(0) @binding(2) var sceneSampler : sampler;
+@group(0) @binding(3) var bloomTex : texture_2d<f32>;
 
 // ACES filmic tonemap approximation (Narkowicz 2015).
 fn aces(x : vec3<f32>) -> vec3<f32> {
@@ -361,12 +482,46 @@ fn aces(x : vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_post(in : VsOut) -> @location(0) vec4<f32> {
-  let hdr = textureSample(sceneTex, sceneSampler, in.uv);
-  let exposed = hdr.rgb * params.exposure;
-  let mapped = aces(exposed);
-  return vec4<f32>(mapped, hdr.a);
+  let hdr = textureSample(sceneTex, sceneSampler, in.uv).rgb;
+  let bloom = textureSample(bloomTex, sceneSampler, in.uv).rgb;
+  var color = hdr + bloom * params.bloomIntensity;
+  color = color * params.exposure;
+  var mapped = aces(color);
+
+  // Radial vignette: darken toward the frame edges.
+  if (params.vignetteEnabled > 0.5) {
+    let d = in.uv - vec2<f32>(0.5, 0.5);
+    let dist = length(d) * 1.41421356; // 1.0 at the corners
+    let v = 1.0 - params.vignetteAmount * smoothstep(0.4, 1.0, dist);
+    mapped = mapped * v;
+  }
+
+  return vec4<f32>(mapped, 1.0);
 }
 `;
+
+/** One downsampled bloom mip: two ping-pong textures + their views. */
+interface BloomMip {
+  width: number;
+  height: number;
+  texA: GpuTextureLike;
+  viewA: GpuTextureViewLike;
+  texB: GpuTextureLike;
+  viewB: GpuTextureViewLike;
+}
+
+/** Resolved (non-optional) post-FX state held by the renderer. */
+interface ResolvedBloom {
+  enabled: boolean;
+  threshold: number;
+  intensity: number;
+  radius: number;
+}
+
+interface ResolvedVignette {
+  enabled: boolean;
+  amount: number;
+}
 
 export class WebgpuRenderer implements Renderer {
   readonly backend: RendererBackend = "webgpu";
@@ -378,6 +533,16 @@ export class WebgpuRenderer implements Renderer {
   private scenePipeline: GpuRenderPipelineLike | null = null;
   private postPipeline: GpuRenderPipelineLike | null = null;
   private postBindGroupLayout: GpuBindGroupLayoutLike | null = null;
+
+  // Bloom pipelines + their shared bind-group layouts.
+  private brightPipeline: GpuRenderPipelineLike | null = null;
+  private blurPipeline: GpuRenderPipelineLike | null = null;
+  private upsamplePipeline: GpuRenderPipelineLike | null = null;
+  /** Layout for bright-pass + blur (uniform + texture + sampler). */
+  private bloomBindGroupLayout: GpuBindGroupLayoutLike | null = null;
+  /** Layout for upsample (texture + sampler, no uniform). */
+  private upsampleBindGroupLayout: GpuBindGroupLayoutLike | null = null;
+
   private format = "bgra8unorm";
   private size: DrawingBufferSize = { width: 0, height: 0 };
 
@@ -396,11 +561,25 @@ export class WebgpuRenderer implements Renderer {
   private hdrView: GpuTextureViewLike | null = null;
   private sampler: GpuSamplerLike | null = null;
   private postUniformBuffer: GpuBufferLike | null = null;
+  private bloomUniformBuffer: GpuBufferLike | null = null;
   private postBindGroup: GpuBindGroupLike | null = null;
+
+  /** Downsampled bloom mip chain (created on resize). */
+  private bloomMips: BloomMip[] = [];
 
   /** Post-FX state. Exposure default is neutral (1.0). */
   private exposure = DEFAULT_EXPOSURE;
-  /** Set when exposure changed and the uniform buffer needs reupload. */
+  private bloom: ResolvedBloom = {
+    enabled: DEFAULT_BLOOM_ENABLED,
+    threshold: DEFAULT_BLOOM_THRESHOLD,
+    intensity: DEFAULT_BLOOM_INTENSITY,
+    radius: DEFAULT_BLOOM_RADIUS,
+  };
+  private vignette: ResolvedVignette = {
+    enabled: DEFAULT_VIGNETTE_ENABLED,
+    amount: DEFAULT_VIGNETTE_AMOUNT,
+  };
+  /** Set when composite params changed and the uniform buffer needs reupload. */
   private postParamsDirty = true;
 
   constructor(options: WebgpuRendererOptions) {
@@ -427,9 +606,6 @@ export class WebgpuRenderer implements Renderer {
     ctx.configure({ device, format: this.format, alphaMode: "premultiplied" });
 
     // SCENE pipeline: instanced quads → HDR offscreen target. Built ONCE.
-    // The per-instance buffer feeds location(0) = rect (x,y,w,h) and
-    // location(1) = color (r,g,b,a), packed contiguously as 8 f32 per instance.
-    // Its fragment target is the HDR format, NOT the swapchain format.
     const sceneModule = device.createShaderModule({ code: QUAD_SHADER });
     this.scenePipeline = device.createRenderPipeline({
       layout: "auto",
@@ -455,18 +631,84 @@ export class WebgpuRenderer implements Renderer {
       primitive: { topology: "triangle-list" },
     });
 
-    // POST pipeline: fullscreen triangle sampling the HDR texture → swapchain.
-    // We declare an explicit bind-group layout (uniform + texture + sampler) so
-    // the bind group can be rebuilt against fresh texture views on resize.
+    // BLOOM bind-group layout (uniform + texture + sampler), shared by the
+    // bright-pass and both blur directions.
+    const bloomLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: 0x2 /* FRAGMENT */, buffer: { type: "uniform" } },
+        { binding: 1, visibility: 0x2, texture: { sampleType: "float", viewDimension: "2d" } },
+        { binding: 2, visibility: 0x2, sampler: { type: "filtering" } },
+      ],
+    });
+    this.bloomBindGroupLayout = bloomLayout;
+    const bloomPipelineLayout = device.createPipelineLayout({
+      bindGroupLayouts: [bloomLayout],
+    });
+
+    const brightModule = device.createShaderModule({ code: BRIGHT_PASS_SHADER });
+    this.brightPipeline = device.createRenderPipeline({
+      layout: bloomPipelineLayout,
+      vertex: { module: brightModule, entryPoint: "vs_fullscreen" },
+      fragment: {
+        module: brightModule,
+        entryPoint: "fs_bright",
+        targets: [{ format: HDR_FORMAT }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+
+    const blurModule = device.createShaderModule({ code: BLUR_SHADER });
+    this.blurPipeline = device.createRenderPipeline({
+      layout: bloomPipelineLayout,
+      vertex: { module: blurModule, entryPoint: "vs_fullscreen" },
+      fragment: {
+        module: blurModule,
+        entryPoint: "fs_blur",
+        targets: [{ format: HDR_FORMAT }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+
+    // UPSAMPLE layout (texture + sampler) and pipeline (additive blend).
+    const upsampleLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: 0x2, texture: { sampleType: "float", viewDimension: "2d" } },
+        { binding: 1, visibility: 0x2, sampler: { type: "filtering" } },
+      ],
+    });
+    this.upsampleBindGroupLayout = upsampleLayout;
+    const upsamplePipelineLayout = device.createPipelineLayout({
+      bindGroupLayouts: [upsampleLayout],
+    });
+    const upsampleModule = device.createShaderModule({ code: UPSAMPLE_SHADER });
+    this.upsamplePipeline = device.createRenderPipeline({
+      layout: upsamplePipelineLayout,
+      vertex: { module: upsampleModule, entryPoint: "vs_fullscreen" },
+      fragment: {
+        module: upsampleModule,
+        entryPoint: "fs_upsample",
+        targets: [
+          {
+            format: HDR_FORMAT,
+            // Additive: dst = src*1 + dst*1, so smaller mips accumulate.
+            blend: {
+              color: { srcFactor: "one", dstFactor: "one", operation: "add" },
+              alpha: { srcFactor: "one", dstFactor: "one", operation: "add" },
+            },
+          },
+        ],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+
+    // POST pipeline: fullscreen triangle sampling HDR + bloom → swapchain.
     const postModule = device.createShaderModule({ code: POST_SHADER });
     const postLayout = device.createBindGroupLayout({
       entries: [
-        // 0: exposure/params uniform, visible to the fragment stage.
-        { binding: 0, visibility: 0x2 /* FRAGMENT */, buffer: { type: "uniform" } },
-        // 1: the HDR scene texture (float, 2d).
+        { binding: 0, visibility: 0x2, buffer: { type: "uniform" } },
         { binding: 1, visibility: 0x2, texture: { sampleType: "float", viewDimension: "2d" } },
-        // 2: the sampler.
         { binding: 2, visibility: 0x2, sampler: { type: "filtering" } },
+        { binding: 3, visibility: 0x2, texture: { sampleType: "float", viewDimension: "2d" } },
       ],
     });
     this.postBindGroupLayout = postLayout;
@@ -475,7 +717,7 @@ export class WebgpuRenderer implements Renderer {
     });
     this.postPipeline = device.createRenderPipeline({
       layout: postPipelineLayout,
-      vertex: { module: postModule, entryPoint: "vs_post" },
+      vertex: { module: postModule, entryPoint: "vs_fullscreen" },
       fragment: {
         module: postModule,
         entryPoint: "fs_post",
@@ -484,10 +726,14 @@ export class WebgpuRenderer implements Renderer {
       primitive: { topology: "triangle-list" },
     });
 
-    // The sampler + post params uniform persist across frames/resizes.
+    // The sampler + uniform buffers persist across frames/resizes.
     this.sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
     this.postUniformBuffer = device.createBuffer({
       size: POST_UNIFORM_BYTES,
+      usage: BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST,
+    });
+    this.bloomUniformBuffer = device.createBuffer({
+      size: BLOOM_UNIFORM_BYTES,
       usage: BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST,
     });
     this.postParamsDirty = true;
@@ -495,16 +741,16 @@ export class WebgpuRenderer implements Renderer {
     this.device = device;
     this.context = ctx;
 
-    // Build the HDR target for the current size (if resize() already ran).
-    this.ensureHdrTarget();
+    // Build the HDR target + bloom mip chain for the current size.
+    this.ensureTargets();
   }
 
   resize(cssWidth: number, cssHeight: number, dpr: number): void {
     this.size = computeDrawingBufferSize(cssWidth, cssHeight, dpr);
     this.canvas.width = this.size.width;
     this.canvas.height = this.size.height;
-    // Recreate the offscreen HDR texture (and post bind group) at the new size.
-    this.ensureHdrTarget();
+    // Recreate the offscreen HDR texture, bloom mips, and post bind group.
+    this.ensureTargets();
   }
 
   render(scene: Scene, _features: RenderFeatures, _timeSeconds: number): void {
@@ -514,10 +760,50 @@ export class WebgpuRenderer implements Renderer {
 
   setPostEffects(config: PostEffectsConfig): void {
     if (config.exposure != null) {
-      const e = config.exposure;
-      const next = Number.isFinite(e) && e >= 0 ? e : DEFAULT_EXPOSURE;
+      const next = clampNonNegative(config.exposure, DEFAULT_EXPOSURE);
       if (next !== this.exposure) {
         this.exposure = next;
+        this.postParamsDirty = true;
+      }
+    }
+    if (config.bloom) {
+      this.applyBloom(config.bloom);
+    }
+    if (config.vignette) {
+      this.applyVignette(config.vignette);
+    }
+  }
+
+  private applyBloom(bloom: BloomConfig): void {
+    if (bloom.enabled != null) {
+      this.bloom.enabled = bloom.enabled;
+      this.postParamsDirty = true;
+    }
+    if (bloom.threshold != null) {
+      this.bloom.threshold = clampNonNegative(bloom.threshold, DEFAULT_BLOOM_THRESHOLD);
+    }
+    if (bloom.intensity != null) {
+      const next = clampNonNegative(bloom.intensity, DEFAULT_BLOOM_INTENSITY);
+      if (next !== this.bloom.intensity) {
+        this.bloom.intensity = next;
+        this.postParamsDirty = true;
+      }
+    }
+    if (bloom.radius != null) {
+      this.bloom.radius = clampNonNegative(bloom.radius, DEFAULT_BLOOM_RADIUS);
+    }
+  }
+
+  private applyVignette(vignette: VignetteConfig): void {
+    if (vignette.enabled != null) {
+      this.vignette.enabled = vignette.enabled;
+      this.postParamsDirty = true;
+    }
+    if (vignette.amount != null) {
+      const a = vignette.amount;
+      const next = Number.isFinite(a) ? Math.min(Math.max(a, 0), 1) : DEFAULT_VIGNETTE_AMOUNT;
+      if (next !== this.vignette.amount) {
+        this.vignette.amount = next;
         this.postParamsDirty = true;
       }
     }
@@ -546,11 +832,8 @@ export class WebgpuRenderer implements Renderer {
     }
     this.frameOpen = false;
 
-    // The offscreen HDR target + post bind group must exist (built in
-    // init()/resize()). If a frame somehow runs before a non-zero resize, build
-    // a minimal target now so the two-pass path is always honoured.
     if (!this.hdrView || !this.postBindGroup) {
-      this.ensureHdrTarget();
+      this.ensureTargets();
     }
     const hdrView = this.hdrView;
     const postBindGroup = this.postBindGroup;
@@ -574,7 +857,6 @@ export class WebgpuRenderer implements Renderer {
         data[base + 6] = rect.color.b;
         data[base + 7] = rect.color.a;
       }
-      // Upload exactly the bytes for `count` instances.
       device.queue.writeBuffer(
         this.instanceBuffer!,
         0,
@@ -584,18 +866,27 @@ export class WebgpuRenderer implements Renderer {
       );
     }
 
-    // Upload post-FX params (exposure) when they changed.
+    // Upload composite params (exposure, bloom intensity, vignette) when dirty.
     if (this.postParamsDirty && this.postUniformBuffer) {
-      const params = new Float32Array([this.exposure, 0, 0, 0]);
-      device.queue.writeBuffer(this.postUniformBuffer, 0, params.buffer, params.byteOffset, POST_UNIFORM_BYTES);
+      const params = new Float32Array([
+        this.exposure,
+        this.bloom.enabled ? this.bloom.intensity : 0,
+        this.vignette.enabled ? 1 : 0,
+        this.vignette.amount,
+      ]);
+      device.queue.writeBuffer(
+        this.postUniformBuffer,
+        0,
+        params.buffer,
+        params.byteOffset,
+        POST_UNIFORM_BYTES,
+      );
       this.postParamsDirty = false;
     }
 
     const encoder = device.createCommandEncoder();
 
     // ── PASS 1: SCENE → offscreen HDR texture ──
-    // Clear the HDR target to the background, then one instanced draw paints all
-    // rects on top — correct compositing, no per-rect clears.
     const scenePass = encoder.beginRenderPass({
       colorAttachments: [
         {
@@ -608,17 +899,23 @@ export class WebgpuRenderer implements Renderer {
     });
     scenePass.setPipeline(scenePipeline);
     if (count > 0) {
-      // The pipeline declares an instance vertex buffer at slot 0; it MUST be
-      // bound before any draw. With no rects we issue NO draw at all: the HDR
-      // target is just the background clear.
       scenePass.setVertexBuffer(0, this.instanceBuffer!);
       scenePass.draw(6, count);
     }
     scenePass.end();
 
-    // ── PASS 2: POST / COMPOSITE → swapchain ──
-    // Sample the HDR target with a fullscreen triangle, apply exposure+tonemap,
-    // and present to the canvas swapchain.
+    // ── BLOOM PASSES (optional) → downsampled mip chain ──
+    // When bloom is enabled, run the bright-pass + separable blur per mip and
+    // upsample-accumulate so the largest mip carries the full glow that the
+    // composite reads. When disabled, the bloom passes are skipped entirely:
+    // the composite's `bloomIntensity` uniform is 0 (see params upload above),
+    // so whatever stale content sits in the bloom texture contributes nothing.
+    const bloomActive = this.bloom.enabled && this.bloomMips.length > 0;
+    if (bloomActive) {
+      this.runBloom(device, encoder, hdrView);
+    }
+
+    // ── FINAL PASS: POST / COMPOSITE → swapchain ──
     const swapView = context.getCurrentTexture().createView();
     const postPass = encoder.beginRenderPass({
       colorAttachments: [
@@ -639,12 +936,170 @@ export class WebgpuRenderer implements Renderer {
   }
 
   /**
-   * (Re)create the offscreen HDR texture + its view at the current size, then
-   * rebuild the post-pass bind group against the new view. Called from
-   * init()/resize() and defensively before the first frame. Releases the prior
-   * texture so resizes don't leak GPU memory.
+   * Run the full bloom chain into the mip pyramid:
+   *   1. bright-pass: HDR scene → mip0.texA (threshold applied)
+   *   2. for each mip i (largest→smallest): blur H then V (ping-pong texA/texB),
+   *      ending in texA; then downsample texA into the next-smaller mip's texA.
+   *   3. upsample-accumulate (smallest→largest) additively folding each mip back
+   *      into the next-larger mip's texA.
+   * The composite reads mip0.viewA (the largest, fully-accumulated glow).
+   *
+   * Each blur invocation re-uploads the bloom uniform to flip the blur direction
+   * and carry threshold/radius; this is a tiny 16-byte write per call.
    */
-  private ensureHdrTarget(): void {
+  private runBloom(
+    device: GpuDeviceLike,
+    encoder: GpuCommandEncoderLike,
+    hdrView: GpuTextureViewLike,
+  ): void {
+    const bright = this.brightPipeline;
+    const blur = this.blurPipeline;
+    const upsample = this.upsamplePipeline;
+    const bloomLayout = this.bloomBindGroupLayout;
+    const upLayout = this.upsampleBindGroupLayout;
+    const sampler = this.sampler;
+    const bloomUniform = this.bloomUniformBuffer;
+    if (!bright || !blur || !upsample || !bloomLayout || !upLayout || !sampler || !bloomUniform) {
+      return;
+    }
+    const mips = this.bloomMips;
+    const mip0 = mips[0]!;
+
+    // 1) BRIGHT-PASS: HDR scene → mip0.texA. threshold in uniform.x.
+    this.writeBloomUniform(device, this.bloom.threshold, 0, 0, this.bloom.radius);
+    this.fullscreenPass(encoder, mip0.viewA, bright, this.makeBloomBindGroup(device, bloomLayout, sampler, bloomUniform, hdrView));
+
+    // 2) Per-mip blur (H then V) ending in texA, then downsample to next mip.
+    for (let i = 0; i < mips.length; i++) {
+      const mip = mips[i]!;
+      // Horizontal blur: texA → texB.
+      this.writeBloomUniform(device, this.bloom.threshold, 1, 0, this.bloom.radius);
+      this.fullscreenPass(
+        encoder,
+        mip.viewB,
+        blur,
+        this.makeBloomBindGroup(device, bloomLayout, sampler, bloomUniform, mip.viewA),
+      );
+      // Vertical blur: texB → texA.
+      this.writeBloomUniform(device, this.bloom.threshold, 0, 1, this.bloom.radius);
+      this.fullscreenPass(
+        encoder,
+        mip.viewA,
+        blur,
+        this.makeBloomBindGroup(device, bloomLayout, sampler, bloomUniform, mip.viewB),
+      );
+
+      // Downsample this mip's blurred result into the next (smaller) mip's texA
+      // via a plain (non-additive) copy through the upsample pipeline. We clear
+      // the destination first by writing (loadOp clear) so it starts fresh.
+      const next = mips[i + 1];
+      if (next) {
+        this.fullscreenPass(
+          encoder,
+          next.viewA,
+          upsample,
+          this.makeUpsampleBindGroup(device, upLayout, sampler, mip.viewA),
+          { r: 0, g: 0, b: 0, a: 1 },
+        );
+      }
+    }
+
+    // 3) Upsample-accumulate smallest → largest (additive blend folds glow up).
+    for (let i = mips.length - 1; i > 0; i--) {
+      const src = mips[i]!;
+      const dst = mips[i - 1]!;
+      this.fullscreenPass(
+        encoder,
+        dst.viewA,
+        upsample,
+        this.makeUpsampleBindGroup(device, upLayout, sampler, src.viewA),
+        // No clearValue: LOAD the existing (blurred) dst and ADD onto it.
+        undefined,
+      );
+    }
+  }
+
+  /** Run a fullscreen-triangle pass into `view` with the given pipeline + bind group. */
+  private fullscreenPass(
+    encoder: GpuCommandEncoderLike,
+    view: GpuTextureViewLike,
+    pipeline: GpuRenderPipelineLike,
+    bindGroup: GpuBindGroupLike,
+    clearValue?: { r: number; g: number; b: number; a: number },
+  ): void {
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view,
+          clearValue: clearValue ?? { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: clearValue ? "clear" : "load",
+          storeOp: "store",
+        },
+      ],
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(3, 1);
+    pass.end();
+  }
+
+  private makeBloomBindGroup(
+    device: GpuDeviceLike,
+    layout: GpuBindGroupLayoutLike,
+    sampler: GpuSamplerLike,
+    uniform: GpuBufferLike,
+    srcView: GpuTextureViewLike,
+  ): GpuBindGroupLike {
+    return device.createBindGroup({
+      layout,
+      entries: [
+        { binding: 0, resource: { buffer: uniform } },
+        { binding: 1, resource: srcView },
+        { binding: 2, resource: sampler },
+      ],
+    });
+  }
+
+  private makeUpsampleBindGroup(
+    device: GpuDeviceLike,
+    layout: GpuBindGroupLayoutLike,
+    sampler: GpuSamplerLike,
+    srcView: GpuTextureViewLike,
+  ): GpuBindGroupLike {
+    return device.createBindGroup({
+      layout,
+      entries: [
+        { binding: 0, resource: srcView },
+        { binding: 1, resource: sampler },
+      ],
+    });
+  }
+
+  private writeBloomUniform(
+    device: GpuDeviceLike,
+    threshold: number,
+    dirX: number,
+    dirY: number,
+    radius: number,
+  ): void {
+    if (!this.bloomUniformBuffer) return;
+    const data = new Float32Array([threshold, dirX, dirY, radius]);
+    device.queue.writeBuffer(
+      this.bloomUniformBuffer,
+      0,
+      data.buffer,
+      data.byteOffset,
+      BLOOM_UNIFORM_BYTES,
+    );
+  }
+
+  /**
+   * (Re)create the offscreen HDR texture + bloom mip chain at the current size,
+   * then rebuild the post-pass bind group against the fresh HDR + bloom views.
+   * Called from init()/resize() and defensively before the first frame. Releases
+   * prior textures so resizes don't leak GPU memory.
+   */
+  private ensureTargets(): void {
     const device = this.device;
     const sampler = this.sampler;
     const layout = this.postBindGroupLayout;
@@ -653,8 +1108,10 @@ export class WebgpuRenderer implements Renderer {
     const { width, height } = this.size;
     if (width <= 0 || height <= 0) return;
 
-    // Release the prior target before allocating a new one.
+    // Release the prior HDR target + bloom mips before allocating anew.
     this.hdrTexture?.destroy?.();
+    this.releaseBloomMips();
+
     const texture = device.createTexture({
       size: { width, height },
       format: HDR_FORMAT,
@@ -664,20 +1121,58 @@ export class WebgpuRenderer implements Renderer {
     this.hdrTexture = texture;
     this.hdrView = view;
 
+    // Build the downsampled bloom mip chain (each level half the prior, min 1px).
+    this.bloomMips = [];
+    let mw = width;
+    let mh = height;
+    for (let i = 0; i < BLOOM_MIP_LEVELS; i++) {
+      mw = Math.max(1, Math.floor(mw / 2));
+      mh = Math.max(1, Math.floor(mh / 2));
+      const texA = device.createTexture({
+        size: { width: mw, height: mh },
+        format: HDR_FORMAT,
+        usage: TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING,
+      });
+      const texB = device.createTexture({
+        size: { width: mw, height: mh },
+        format: HDR_FORMAT,
+        usage: TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING,
+      });
+      this.bloomMips.push({
+        width: mw,
+        height: mh,
+        texA,
+        viewA: texA.createView(),
+        texB,
+        viewB: texB.createView(),
+      });
+      if (mw === 1 && mh === 1) break;
+    }
+
+    const bloomView = this.bloomMips[0]?.viewA ?? view;
     this.postBindGroup = device.createBindGroup({
       layout,
       entries: [
         { binding: 0, resource: { buffer: uniform } },
         { binding: 1, resource: view },
         { binding: 2, resource: sampler },
+        { binding: 3, resource: bloomView },
       ],
     });
+  }
+
+  /** Destroy and clear the bloom mip chain. */
+  private releaseBloomMips(): void {
+    for (const mip of this.bloomMips) {
+      mip.texA.destroy?.();
+      mip.texB.destroy?.();
+    }
+    this.bloomMips = [];
   }
 
   /** Grow (or first-create) the instance buffer to hold at least `count` rects. */
   private ensureInstanceCapacity(device: GpuDeviceLike, count: number): void {
     if (this.instanceBuffer && this.instanceCapacity >= count) return;
-    // Grow geometrically to amortize reallocations across frames.
     const capacity = Math.max(count, this.instanceCapacity * 2, 64);
     this.instanceBuffer?.destroy?.();
     this.instanceBuffer = device.createBuffer({
@@ -712,19 +1207,39 @@ export class WebgpuRenderer implements Renderer {
     this.hdrTexture?.destroy?.();
     this.hdrTexture = null;
     this.hdrView = null;
+    this.releaseBloomMips();
     this.postUniformBuffer?.destroy?.();
     this.postUniformBuffer = null;
+    this.bloomUniformBuffer?.destroy?.();
+    this.bloomUniformBuffer = null;
     this.postBindGroup = null;
     this.postBindGroupLayout = null;
+    this.bloomBindGroupLayout = null;
+    this.upsampleBindGroupLayout = null;
     this.sampler = null;
     this.scenePipeline = null;
     this.postPipeline = null;
+    this.brightPipeline = null;
+    this.blurPipeline = null;
+    this.upsamplePipeline = null;
     this.context?.unconfigure?.();
     this.context = null;
     this.device = null;
     this.rects = [];
     this.frameOpen = false;
     this.exposure = DEFAULT_EXPOSURE;
+    this.bloom = {
+      enabled: DEFAULT_BLOOM_ENABLED,
+      threshold: DEFAULT_BLOOM_THRESHOLD,
+      intensity: DEFAULT_BLOOM_INTENSITY,
+      radius: DEFAULT_BLOOM_RADIUS,
+    };
+    this.vignette = { enabled: DEFAULT_VIGNETTE_ENABLED, amount: DEFAULT_VIGNETTE_AMOUNT };
     this.postParamsDirty = true;
   }
+}
+
+/** Clamp a value to a finite, non-negative number, falling back to `fallback`. */
+function clampNonNegative(value: number, fallback: number): number {
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
