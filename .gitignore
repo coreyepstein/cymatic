@@ -1,5 +1,8 @@
 node_modules/
 dist/
+dist-types/
 .turbo/
+*.tsbuildinfo
+coverage/
 *.log
 .DS_Store

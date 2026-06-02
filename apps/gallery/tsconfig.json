@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist-types",
+    "rootDir": "./src",
+    "jsx": "react-jsx",
+    "noEmit": false
+  },
+  "references": [
+    { "path": "../../packages/core" },
+    { "path": "../../packages/presets" },
+    { "path": "../../packages/react" }
+  ],
+  "include": ["src/**/*"],
+  "exclude": ["dist", "dist-types", "node_modules", "**/*.test.ts", "**/*.test.tsx"]
+}

@@ -1,0 +1,10 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/core" },
+    { "path": "packages/presets" },
+    { "path": "packages/react" },
+    { "path": "packages/export" },
+    { "path": "apps/gallery" }
+  ]
+}
