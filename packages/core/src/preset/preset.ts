@@ -16,6 +16,7 @@
  */
 
 import type { AudioFeatureFrame } from "../audio/features.js";
+import type { ParamSchema } from "../params/schema.js";
 import type { Renderer } from "../render/renderer.js";
 
 /**
@@ -69,6 +70,14 @@ export interface PresetMeta {
   readonly description?: string;
   /** Optional tags for discovery / filtering. */
   readonly tags?: readonly string[];
+  /**
+   * Optional declarative parameter schema (V2-08). When present, hosts can
+   * introspect a preset's tunable knobs without instantiating it (to
+   * auto-render controls); the preset reads resolved values each frame via a
+   * {@link "../params/index.js".ParamSet}. Presets that omit `params` keep
+   * working exactly as before — the field is purely additive.
+   */
+  readonly params?: readonly ParamSchema[];
 }
 
 /**
@@ -105,6 +114,7 @@ export function definePreset(input: DefinePresetInput): PresetDefinition {
     name: input.name,
     description: input.description,
     tags: input.tags,
+    params: input.params,
     create: input.create,
   });
 }

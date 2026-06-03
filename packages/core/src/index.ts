@@ -36,6 +36,12 @@ export * from "./primitives/index.js";
 // built only from the public primitive surface.
 export * from "./preset/index.js";
 
+// Parameter system (V2-08): a declarative, introspectable named-parameter
+// framework presets use to expose tunable knobs driven automatically (audio /
+// mood / director / LFO / seeded random) or manually. Pure + deterministic; the
+// ParamSet controller + resolveParams resolver power gallery auto-controls.
+export * from "./params/index.js";
+
 // Auto-director (V2-07): a stateful, deterministic real-time engine that tracks
 // where a track is in its arc (intro → build → sustain → drop → breakdown →
 // outro) and evolves normalized macro signals — intensity, motion, bloom,
