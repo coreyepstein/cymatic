@@ -11,8 +11,9 @@ import {
 import { version as coreVersion } from "@cymatic/core";
 import { allPresets } from "@cymatic/presets";
 import { Visualizer, type VisualizerRef } from "@cymatic/react";
-import type { Preset, PresetDefinition } from "@cymatic/core";
+import type { DirectorState, ParamSet, Preset, PresetDefinition } from "@cymatic/core";
 
+import { ControlPanel } from "./ControlPanel.js";
 import { buildSnippet } from "./snippet.js";
 
 const DOCS_URL = "https://github.com/coreyepstein/cymatic#readme";
@@ -78,8 +79,35 @@ export function App(): JSX.Element {
   const [dragging, setDragging] = useState(false);
   const [copied, setCopied] = useState(false);
 
+  // Director controls + HUD state (V2-14). The live DirectorState is fed back
+  // from the engine via onDirectorState (throttled below); the toggle + seed are
+  // forwarded to <Visualizer/> which drives the core Director without a teardown.
+  const [directorEnabled, setDirectorEnabled] = useState(true);
+  const [seed, setSeed] = useState(0x1a2b3c4d);
+  const [director, setDirector] = useState<DirectorState | null>(null);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const vizRef = useRef<VisualizerRef>(null);
+
+  // The engine emits a DirectorState every frame; throttle HUD updates to a few
+  // per second so we don't re-render the whole panel at 60fps. The latest state
+  // is parked in a ref and flushed on an interval.
+  const directorLatest = useRef<DirectorState | null>(null);
+  const onDirectorState = useCallback((s: DirectorState) => {
+    directorLatest.current = s;
+  }, []);
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      if (directorLatest.current) setDirector(directorLatest.current);
+    }, 150);
+    return () => window.clearInterval(id);
+  }, []);
+
+  // The active preset's ParamSet is surfaced through the imperative ref (which
+  // does not re-render), so the panel reads it through this stable getter.
+  const getParamSet = useCallback((): ParamSet | null => {
+    return vizRef.current?.paramSet ?? null;
+  }, []);
 
   const backendAvailable = useMemo(hasRenderBackend, []);
 
@@ -248,7 +276,18 @@ export function App(): JSX.Element {
                 preset={preset}
                 microphone={input.kind === "mic"}
                 audioBuffer={input.kind === "file" ? input.buffer : undefined}
+                directorEnabled={directorEnabled}
+                directorSeed={seed}
+                onDirectorState={onDirectorState}
                 ariaLabel={`${selectedDef?.name ?? "cymatic"} visualizer`}
+              />
+              <ControlPanel
+                getParamSet={getParamSet}
+                director={director}
+                directorEnabled={directorEnabled}
+                onToggleDirector={setDirectorEnabled}
+                seed={seed}
+                onSeedChange={setSeed}
               />
               {isMicError ? (
                 <div className="status-overlay">

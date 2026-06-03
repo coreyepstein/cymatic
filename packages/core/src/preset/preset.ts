@@ -17,6 +17,7 @@
 
 import type { AudioFeatureFrame } from "../audio/features.js";
 import type { ParamSchema, ParamValue } from "../params/schema.js";
+import type { ParamSet } from "../params/param-set.js";
 import type { DirectorState } from "../director/director.js";
 import type { Renderer } from "../render/renderer.js";
 
@@ -93,6 +94,17 @@ export interface Preset {
 
   /** Release preset-held resources. Idempotent. */
   dispose(): void;
+
+  /**
+   * The preset's per-instance {@link ParamSet}, when it declared a `params`
+   * schema and resolves its own parameters (V2-14). Optional and additive: a
+   * preset without parameters (or one that takes pre-resolved values from the
+   * host) leaves this absent/`null`. A host (the gallery) reads it to
+   * auto-render controls, set manual overrides, randomize, or re-bind a param
+   * to its default — driving the live look without reaching into preset code.
+   * Compositions built with `composePreset` populate it automatically.
+   */
+  readonly paramSet?: ParamSet | null;
 }
 
 /** Static metadata describing a preset, independent of any instance. */

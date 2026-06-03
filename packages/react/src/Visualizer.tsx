@@ -21,7 +21,14 @@ import {
   type UseVisualizerOptions,
   type VisualizerHandle,
 } from "./hooks.js";
-import type { AnalyserOptions, AudioFeatureFrame, CreateRendererOptions, Preset } from "@cymatic/core";
+import type {
+  AnalyserOptions,
+  AudioFeatureFrame,
+  CreateRendererOptions,
+  DirectorState,
+  ParamSet,
+  Preset,
+} from "@cymatic/core";
 
 /** Props for {@link Visualizer}. */
 export interface VisualizerProps {
@@ -44,6 +51,12 @@ export interface VisualizerProps {
 
   /** Per-frame feature callback. */
   onFeatures?: (frame: AudioFeatureFrame) => void;
+  /** Per-frame director-state callback (for a director HUD). */
+  onDirectorState?: (state: DirectorState) => void;
+  /** Enable the auto-director (default `true`); when off, params fall back to audio/manual. */
+  directorEnabled?: boolean;
+  /** Seed for the director's deterministic drift; changing it reseeds live. */
+  directorSeed?: number;
   /** Pause / resume the render loop. */
   paused?: boolean;
 
@@ -67,6 +80,11 @@ export interface VisualizerRef {
   error: Error | null;
   /** The most recent feature frame. */
   features: AudioFeatureFrame | null;
+  /**
+   * The active preset's {@link ParamSet} (or `null` if it declares no params).
+   * A host drives live parameter controls through it (V2-14).
+   */
+  paramSet: ParamSet | null;
 }
 
 export const Visualizer = forwardRef<VisualizerRef, VisualizerProps>(function Visualizer(
@@ -82,6 +100,9 @@ export const Visualizer = forwardRef<VisualizerRef, VisualizerProps>(function Vi
     analyser,
     renderer,
     onFeatures,
+    onDirectorState,
+    directorEnabled,
+    directorSeed,
     paused,
     className,
     style,
@@ -97,6 +118,9 @@ export const Visualizer = forwardRef<VisualizerRef, VisualizerProps>(function Vi
     analyser,
     renderer,
     onFeatures,
+    onDirectorState,
+    directorEnabled,
+    directorSeed,
     paused,
   });
 
@@ -106,8 +130,9 @@ export const Visualizer = forwardRef<VisualizerRef, VisualizerProps>(function Vi
       ready: handle.ready,
       error: handle.error,
       features: handle.features,
+      paramSet: handle.paramSet,
     }),
-    [handle.ready, handle.error, handle.features],
+    [handle.ready, handle.error, handle.features, handle.paramSet],
   );
 
   return (

@@ -219,6 +219,10 @@ export function composePreset(options: ComposeOptions): PresetDefinition {
       const EMPTY_PARAMS: Readonly<Record<string, ParamValue>> = Object.freeze({});
 
       return {
+        // Expose the instance ParamSet so a host (the gallery control panel)
+        // can introspect / set / randomize / re-bind params live (V2-14). Null
+        // when this composition declares no params.
+        paramSet,
         async init(ctx: PresetContext): Promise<void> {
           renderer = ctx.renderer;
           size = { width: ctx.width, height: ctx.height, dpr: ctx.dpr };

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   AnalyserOptions,
   AudioFeatureFrame,
+  DirectorState,
   Preset,
   Renderer,
 } from "@cymatic/core";
@@ -177,6 +178,53 @@ describe("<Visualizer />", () => {
 
     await waitFor(() => {
       expect(ref.current?.ready).toBe(true);
+    });
+  });
+
+  it("emits director state per frame; toggling off yields a resting state", async () => {
+    // With the director enabled, the per-frame callback receives an evolving
+    // DirectorState; disabling it yields the resting state (intensity 0).
+    const preset = makeStubPreset();
+    const onDirectorState = vi.fn();
+    const { rerender } = render(
+      <Visualizer preset={preset} microphone onDirectorState={onDirectorState} directorEnabled />,
+    );
+
+    await waitFor(() => {
+      expect(onDirectorState).toHaveBeenCalled();
+    });
+    const enabledState = onDirectorState.mock.calls.at(-1)?.[0] as DirectorState;
+    expect(enabledState).toHaveProperty("section");
+    expect(enabledState).toHaveProperty("intensity");
+
+    onDirectorState.mockClear();
+    rerender(
+      <Visualizer
+        preset={preset}
+        microphone
+        onDirectorState={onDirectorState}
+        directorEnabled={false}
+      />,
+    );
+    await waitFor(() => {
+      expect(onDirectorState).toHaveBeenCalled();
+    });
+    // The resting state is a calm intro: zero intensity, neutral motion.
+    const restingState = onDirectorState.mock.calls.at(-1)?.[0] as DirectorState;
+    expect(restingState.intensity).toBe(0);
+    expect(restingState.section).toBe("intro");
+  });
+
+  it("surfaces the preset's ParamSet via the imperative ref", async () => {
+    // A preset can expose a ParamSet; the hook surfaces it after init so a host
+    // can drive live controls. A preset without one surfaces null.
+    const fakeParamSet = { getSchema: () => [] } as unknown as Preset["paramSet"];
+    const preset = { ...makeStubPreset(), paramSet: fakeParamSet };
+    const ref = createRef<VisualizerRef>();
+    render(<Visualizer ref={ref} preset={preset} microphone />);
+
+    await waitFor(() => {
+      expect(ref.current?.paramSet).toBe(fakeParamSet);
     });
   });
 
