@@ -37,6 +37,7 @@ export type {
 } from "./renderer.js";
 export {
   createRenderer,
+  createRendererWithFallback,
   computeDrawingBufferSize,
   toRgba,
   expandLineToQuad,

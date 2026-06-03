@@ -21,7 +21,7 @@
  * reports the resolved backend and only asserts a trail when WebGPU ran.
  */
 
-import { createRenderer, type Renderer, type RgbaColor } from "@cymatic/core";
+import { createRendererWithFallback, type Renderer, type RgbaColor } from "@cymatic/core";
 
 interface FeedbackHarness {
   /**
@@ -58,8 +58,11 @@ async function boot(): Promise<void> {
   const canvas = document.getElementById("c") as HTMLCanvasElement | null;
   if (!canvas) throw new Error("feedback-harness: canvas #c missing");
 
-  const renderer: Renderer = createRenderer(canvas);
-  await renderer.init();
+  // Create + init the renderer, transparently falling back to WebGL if the
+  // WebGPU adapter/device can't be acquired (e.g. GPU-less CI runners), so the
+  // harness BOOTS rather than boot-erroring. `backend()` reflects the real
+  // post-fallback backend the spec then branches on.
+  const renderer: Renderer = await createRendererWithFallback(canvas);
   // 256×256 backing store at DPR 1 keeps the capture math simple.
   renderer.resize(256, 256, 1);
 

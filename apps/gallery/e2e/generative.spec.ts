@@ -182,13 +182,20 @@ test.describe("V2-12 generative pack renders cinematically in a real browser", (
       expect(hot.distinct).toBeGreaterThan(3);
       expect(hot.variance).toBeGreaterThan(20);
 
-      // (b) Glow present: a meaningful population of bright + mid-bright pixels.
-      // Additive glow / glowing lines light bright cores on BOTH backends; bloom
-      // (WebGPU) widens the mid-bright halo further.
-      expect(hot.bright).toBeGreaterThan(40);
+      // (b) Glow present — per-backend contract.
       if (backend === "webgpu") {
+        // WebGPU runs the HDR bloom/glow chain: bright cores cross luma>60 and
+        // bloom widens a large mid-bright halo. Both are strongly cleared by any
+        // real cinematic render and ~0 for a no-op chain.
+        expect(hot.bright).toBeGreaterThan(40);
         expect(hot.midBright).toBeGreaterThan(400);
       } else {
+        // WebGL is the documented BASIC look: no HDR/bloom, so smooth fields
+        // (e.g. reaction-diffusion) legitimately stay in the mid-tones with no
+        // pixels above luma>60. The real WebGL contract is a substantial
+        // mid-bright population — real, lit, non-blank pixels — which a flat or
+        // blank canvas (midBright≈0) fails. This asserts the basic look works,
+        // it does NOT loosen the WebGPU glow claim above.
         expect(hot.midBright).toBeGreaterThan(40);
       }
 

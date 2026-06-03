@@ -65,7 +65,15 @@ vi.mock("@cymatic/core", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@cymatic/core")>();
   return {
     ...actual,
-    createRenderer: vi.fn(() => makeFakeRenderer()),
+    // The hook creates its renderer through the core's graceful-fallback helper.
+    // Mock it (not the lower-level createRenderer) so jsdom needs no real
+    // GPU/WebGL: by default it returns an initialized fake WebGL renderer. The
+    // helper's own WebGPU→WebGL fallback logic is unit-tested in @cymatic/core.
+    createRendererWithFallback: vi.fn(async () => {
+      const r = makeFakeRenderer();
+      await r.init();
+      return r;
+    }),
     connectMicrophoneSource: vi.fn(async (_opts?: AnalyserOptions) => ({
       analyser: fakeAnalyser,
       context: {} as AudioContext,
@@ -103,9 +111,9 @@ function makeStubPreset(): Preset & {
 
 // Import AFTER vi.mock so the component picks up the mocked core.
 import { Visualizer, type VisualizerRef } from "./index.js";
-import { createRenderer } from "@cymatic/core";
+import { createRendererWithFallback } from "@cymatic/core";
 
-const mockCreateRenderer = vi.mocked(createRenderer);
+const mockCreateRendererWithFallback = vi.mocked(createRendererWithFallback);
 
 afterEach(() => {
   cleanup();
@@ -237,48 +245,36 @@ describe("<Visualizer />", () => {
     expect(container.querySelector("canvas")).not.toBeNull();
   });
 
-  it("falls back to webgl when a webgpu renderer's init() rejects at runtime", async () => {
+  it("mounts on the WebGL renderer the core fallback helper returns", async () => {
     // REGRESSION: WebGPU can be selected (navigator.gpu exists) yet still fail
-    // in init() — adapter blocklisted, device creation rejects, etc. The hook
-    // must dispose the dead WebGPU renderer and transparently rebuild forcing
-    // backend "webgl", mounting successfully with no unhandled rejection and no
-    // surfaced error.
+    // in init() — null adapter on a GPU-less runner, device rejects, etc. The
+    // hook delegates that recovery to `createRendererWithFallback`, which
+    // transparently brings up WebGL. The hook must wire that renderer and mount
+    // ready with NO surfaced error and NO unhandled rejection. (The helper's own
+    // dispose-dead-WebGPU + rebuild-WebGL logic is unit-tested in @cymatic/core.)
     const unhandled = vi.fn();
     process.on("unhandledRejection", unhandled);
 
-    const webgpuDispose = vi.fn();
-    const failingWebgpu: Renderer = {
-      ...makeFakeRenderer(),
-      backend: "webgpu",
-      // init rejects once — the first (webgpu) attempt.
-      init: vi.fn(async () => {
-        throw new Error("WebGPU device acquisition failed (adapter blocklisted)");
-      }),
-      dispose: webgpuDispose,
-    };
+    // The helper returns a WebGL renderer (the post-fallback result).
     const recoveredWebgl = makeFakeRenderer(); // backend: "webgl"
-
-    // First create() yields the failing webgpu renderer; the retry yields webgl.
-    mockCreateRenderer
-      .mockImplementationOnce(() => failingWebgpu)
-      .mockImplementationOnce(() => recoveredWebgl);
+    mockCreateRendererWithFallback.mockImplementationOnce(async () => {
+      await recoveredWebgl.init();
+      return recoveredWebgl;
+    });
 
     const preset = makeStubPreset();
     const ref = createRef<VisualizerRef>();
     render(<Visualizer ref={ref} preset={preset} microphone />);
 
-    // The preset only inits once the (recovered) renderer is up.
+    // The preset inits once the (recovered) renderer is up.
     await waitFor(() => {
       expect(preset.calls.init).toBe(1);
     });
 
-    // The dead webgpu renderer was disposed and a webgl renderer was rebuilt.
-    expect(webgpuDispose).toHaveBeenCalledTimes(1);
-    expect(mockCreateRenderer).toHaveBeenCalledTimes(2);
-    const secondCallOpts = mockCreateRenderer.mock.calls[1]?.[1];
-    expect(secondCallOpts).toMatchObject({ backend: "webgl" });
+    // The hook created its renderer through the graceful-fallback helper.
+    expect(mockCreateRendererWithFallback).toHaveBeenCalledTimes(1);
 
-    // Mounted cleanly with no surfaced engine error.
+    // Mounted cleanly on the WebGL backend with no surfaced engine error.
     await waitFor(() => {
       expect(ref.current?.ready).toBe(true);
     });
@@ -288,5 +284,22 @@ describe("<Visualizer />", () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(unhandled).not.toHaveBeenCalled();
     process.off("unhandledRejection", unhandled);
+  });
+
+  it("surfaces an engine error when the renderer cannot come up on any backend", async () => {
+    // When neither backend is usable, the helper rejects; the hook surfaces that
+    // as a renderer error rather than silently rendering nothing.
+    const failing = new Error("WebgpuRenderer: no GPU adapter available.");
+    mockCreateRendererWithFallback.mockRejectedValueOnce(failing);
+
+    const preset = makeStubPreset();
+    const ref = createRef<VisualizerRef>();
+    render(<Visualizer ref={ref} preset={preset} microphone />);
+
+    await waitFor(() => {
+      expect(ref.current?.error).toBe(failing);
+    });
+    // The preset never inits when the renderer never comes up.
+    expect(preset.calls.init).toBe(0);
   });
 });

@@ -4,6 +4,7 @@ import type { RendererEnvironment } from "./capabilities.js";
 import {
   computeDrawingBufferSize,
   createRenderer,
+  createRendererWithFallback,
   expandLineToQuad,
   feedbackCombine,
   feedbackSequence,
@@ -225,6 +226,68 @@ describe("createRenderer (backend selection)", () => {
   it("throws when webgpu is forced without a gpu entrypoint", () => {
     const { canvas } = makeFakeCanvas();
     expect(() => createRenderer(canvas, { backend: "webgpu" })).toThrow(/no `gpu` entrypoint/i);
+  });
+});
+
+describe("createRendererWithFallback (graceful WebGPU→WebGL on init failure)", () => {
+  it("initializes the WebGPU renderer when its adapter/device come up", async () => {
+    // A gpu whose requestAdapter yields a usable adapter+device: init succeeds,
+    // so the helper returns the WebGPU renderer unchanged (no fallback).
+    const harness = makeWebgpuHarness();
+    const env: RendererEnvironment = { gpu: harness.gpu, hasWebgl: () => true };
+    const renderer = await createRendererWithFallback(harness.canvas, {
+      environment: env,
+      gpu: harness.gpu,
+    });
+    expect(renderer.backend).toBe("webgpu");
+  });
+
+  it("falls back to WebGL when the WebGPU adapter is null (the GPU-less CI case)", async () => {
+    // navigator.gpu EXISTS (selection picks webgpu) but requestAdapter resolves
+    // null, so WebgpuRenderer.init() throws "no GPU adapter available." — the
+    // EXACT condition on GitHub-hosted runners. The helper must dispose the dead
+    // renderer and bring up WebGL instead, returning a working renderer.
+    const { canvas, contexts } = makeFakeCanvas();
+    const gpu = { requestAdapter: () => Promise.resolve(null) };
+    const env: RendererEnvironment = { gpu, hasWebgl: () => true };
+    const renderer = await createRendererWithFallback(canvas, {
+      environment: env,
+      gpu,
+    });
+    expect(renderer.backend).toBe("webgl");
+    // The fallback renderer actually acquired a WebGL context (not just selected).
+    expect(contexts.some((c) => /webgl/.test(c))).toBe(true);
+    // And it is usable end-to-end through the smoke scene.
+    renderer.resize(64, 64, 1);
+    renderer.render({ background: toRgba({ r: 0, g: 0, b: 0, a: 1 }) }, {}, 0);
+  });
+
+  it("re-throws the original init error when WebGPU fails AND no WebGL is available", async () => {
+    // No WebGL to fall back to: the WebGPU failure is terminal and surfaced as-is
+    // so callers fail loudly rather than silently rendering nothing.
+    const { canvas } = makeFakeCanvas();
+    const gpu = { requestAdapter: () => Promise.resolve(null) };
+    const env: RendererEnvironment = { gpu, hasWebgl: () => false };
+    await expect(
+      createRendererWithFallback(canvas, { environment: env, gpu }),
+    ).rejects.toThrow(/no GPU adapter available/i);
+  });
+
+  it("does NOT fall back when the caller explicitly forced WebGPU", async () => {
+    // An explicit backend:"webgpu" is a strict contract; a null adapter there is
+    // a hard error, never silently downgraded.
+    const { canvas } = makeFakeCanvas();
+    const gpu = { requestAdapter: () => Promise.resolve(null) };
+    await expect(
+      createRendererWithFallback(canvas, { backend: "webgpu", gpu }),
+    ).rejects.toThrow(/no GPU adapter available/i);
+  });
+
+  it("returns a WebGL renderer directly (no retry) when WebGL was selected", async () => {
+    const { canvas } = makeFakeCanvas();
+    const env: RendererEnvironment = { gpu: null, hasWebgl: () => true };
+    const renderer = await createRendererWithFallback(canvas, { environment: env });
+    expect(renderer.backend).toBe("webgl");
   });
 });
 

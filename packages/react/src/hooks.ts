@@ -20,7 +20,7 @@ import {
   RealtimeClock,
   connectElementSource,
   connectMicrophoneSource,
-  createRenderer,
+  createRendererWithFallback,
   playBufferSource,
   toRgba,
   ZERO_MOOD,
@@ -325,34 +325,19 @@ export function useVisualizer(options: UseVisualizerOptions): VisualizerHandle {
       presetRef.current.update(featureFrame, time, dt, { director: directorState });
     };
 
-    // Create a renderer and initialize it, transparently falling back to the
-    // WebGL backend if a WebGPU renderer fails to come up at runtime. WebGPU can
-    // be selected (because `navigator.gpu` exists) yet still fail in `init()` —
-    // e.g. the adapter is blocklisted or device creation rejects. In that case
-    // we dispose the dead renderer and rebuild forcing WebGL. A failure here is
-    // a genuine *renderer* error (surfaced as-is), never a microphone error.
-    const createInitializedRenderer = async (): Promise<Renderer> => {
-      const canvasLike = canvas as unknown as RenderCanvasLike;
-      const r = createRenderer(canvasLike, rendererOptions);
-      try {
-        await r.init();
-        return r;
-      } catch (initErr) {
-        // Only the WebGPU path is worth retrying — a WebGL failure is terminal.
-        if (r.backend !== "webgpu") throw initErr;
-        r.dispose();
-        const fallback = createRenderer(canvasLike, {
-          ...rendererOptions,
-          backend: "webgl",
-        });
-        await fallback.init();
-        return fallback;
-      }
-    };
-
     const setup = async (): Promise<void> => {
       try {
-        renderer = await createInitializedRenderer();
+        // Create + init a renderer, transparently falling back to WebGL if a
+        // WebGPU renderer cannot come up at runtime. WebGPU can be selected
+        // (because `navigator.gpu` exists) yet still fail in `init()` — e.g. the
+        // adapter is null on a GPU-less machine, the adapter is blocklisted, or
+        // device creation rejects. The core helper centralizes that policy. A
+        // failure that escapes here is a genuine *renderer* error (surfaced
+        // as-is), never a microphone error.
+        renderer = await createRendererWithFallback(
+          canvas as unknown as RenderCanvasLike,
+          rendererOptions,
+        );
         if (disposed) return;
 
         applyResize();

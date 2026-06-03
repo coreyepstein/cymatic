@@ -619,3 +619,58 @@ export function createRenderer(
     }
   }
 }
+
+/**
+ * Construct AND initialize a {@link Renderer} for `canvas`, transparently
+ * falling back to the WebGL backend if a WebGPU renderer cannot come up.
+ *
+ * {@link createRenderer} selects a backend from API *presence* — but presence
+ * is not the same as a working device. In particular `navigator.gpu` can EXIST
+ * (so WebGPU is selected) yet `gpu.requestAdapter()` resolve `null` or device
+ * creation reject — e.g. on GPU-less CI runners, a blocklisted adapter, or a
+ * sandbox without a real GPU. In that case {@link Renderer.init} throws and a
+ * caller that only relied on selection would have no working renderer.
+ *
+ * This helper centralizes the graceful-degradation policy: create the selected
+ * renderer and `await init()`; if that throws AND the selected backend was
+ * WebGPU AND a WebGL context is available, dispose the dead renderer and build +
+ * init a `{ ...opts, backend: "webgl" }` renderer instead. A WebGL failure (or a
+ * WebGPU failure with no WebGL available) is terminal and re-thrown as-is, so
+ * callers still fail loudly when there is genuinely no usable backend.
+ *
+ * SSR-safe: like {@link createRenderer}, it touches no browser globals at module
+ * scope; callers invoke it inside an effect / after a canvas exists. Backward
+ * compatible: the synchronous {@link createRenderer} is unchanged.
+ *
+ * @returns the renderer that successfully initialized (selected or fallback).
+ */
+export async function createRendererWithFallback(
+  canvas: RenderCanvasLike,
+  opts: CreateRendererOptions = {},
+): Promise<Renderer> {
+  const renderer = createRenderer(canvas, opts);
+  try {
+    await renderer.init();
+    return renderer;
+  } catch (initErr) {
+    // Only a selected-WebGPU failure is worth retrying — a WebGL failure (or a
+    // renderer the caller explicitly forced) is terminal. Re-throw as-is so the
+    // original error (e.g. "no GPU adapter available") is surfaced when there is
+    // truly nothing to fall back to.
+    if (renderer.backend !== "webgpu" || opts.backend === "webgpu") {
+      throw initErr;
+    }
+    // Resolve the environment exactly as createRenderer would, so the WebGL
+    // availability check matches what the fallback renderer will actually use.
+    const environment: RendererEnvironment = opts.environment ?? detectEnvironment();
+    const hasWebgl = environment.hasWebgl ?? defaultHasWebgl;
+    if (!hasWebgl()) {
+      // No WebGL to fall back to — the WebGPU failure is terminal.
+      throw initErr;
+    }
+    renderer.dispose();
+    const fallback = createRenderer(canvas, { ...opts, backend: "webgl" });
+    await fallback.init();
+    return fallback;
+  }
+}

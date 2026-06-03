@@ -17,7 +17,7 @@
  * The spec reports the resolved backend and tunes its thresholds accordingly.
  */
 
-import { createRenderer, type Renderer, type RgbaColor } from "@cymatic/core";
+import { createRendererWithFallback, type Renderer, type RgbaColor } from "@cymatic/core";
 
 type Primitive = "gradient" | "glow" | "line";
 
@@ -42,8 +42,11 @@ async function boot(): Promise<void> {
   const canvas = document.getElementById("c") as HTMLCanvasElement | null;
   if (!canvas) throw new Error("primitives-harness: canvas #c missing");
 
-  const renderer: Renderer = createRenderer(canvas);
-  await renderer.init();
+  // Create + init the renderer, transparently falling back to WebGL if the
+  // WebGPU adapter/device can't be acquired (e.g. GPU-less CI runners), so the
+  // harness BOOTS rather than boot-erroring. `backend()` reflects the real
+  // post-fallback backend the spec then branches on.
+  const renderer: Renderer = await createRendererWithFallback(canvas);
   renderer.resize(256, 256, 1);
   // Keep post-FX neutral so the primitive's own pixels are what we measure
   // (no bloom spreading the line/gradient, no vignette darkening the edges).
