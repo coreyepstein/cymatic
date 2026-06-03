@@ -22,7 +22,7 @@
  */
 
 import { clamp01, ema, type AudioFeatureFrame } from "../audio/features.js";
-import { type PaletteName } from "../primitives/palette.js";
+import { PALETTE_NAMES, type PaletteName } from "../primitives/palette.js";
 import { Lfo, Rng, deriveSeed } from "./noise.js";
 import {
   DEFAULT_SECTION_THRESHOLDS,
@@ -33,15 +33,13 @@ import {
 } from "./sections.js";
 
 /**
- * The ordered palette rotation the director crossfades through. Section changes
- * advance the active palette; `paletteBlend` ramps the crossfade.
+ * The ordered palette rotation the director crossfades through — the full
+ * cinematic catalog (see {@link PALETTE_NAMES}). Section changes advance the
+ * active palette; `paletteBlend` ramps the crossfade. Consumers resolve a name
+ * to a {@link Palette} via the `palettes` map and feed `sampleBlended` /
+ * `rotateHue` with `paletteBlend` / `hueRotation`.
  */
-export const DIRECTOR_PALETTE_ORDER: readonly PaletteName[] = [
-  "sunset",
-  "aqua",
-  "ember",
-  "mono",
-];
+export const DIRECTOR_PALETTE_ORDER: readonly PaletteName[] = PALETTE_NAMES;
 
 /**
  * A plain, serializable snapshot of the director's macro signals for a frame.

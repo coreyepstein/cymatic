@@ -34,7 +34,13 @@ export {
   withAlpha,
   palette,
   sample,
+  sampleRamp,
+  blendPalettes,
+  sampleBlended,
+  rotateHue,
   palettes,
+  PALETTE_CATALOG,
+  PALETTE_NAMES,
 } from "./palette.js";
 
 export type { TextAlign, TextStyle, LineBox, LayoutOptions } from "./typography.js";
