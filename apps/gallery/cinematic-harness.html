@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>cymatic · cinematic harness</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #000;
+      }
+      #stage {
+        width: 320px;
+        height: 320px;
+      }
+      canvas {
+        display: block;
+        width: 320px;
+        height: 320px;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      V2-15 cinematic verification harness. Drives a REAL @cymatic/core Director
+      + OfflineClock through a synthetic SONG ARC (intro → build → drop →
+      breakdown) so a Playwright spec can prove the headline cinematic
+      guarantees against real GPU pixels: the look EVOLVES over a track, bloom
+      spreads bright halos, different director seeds diverge, and a representative
+      cinematic preset stays within a per-frame perf budget. Exposes
+      `window.__cineHarness`.
+    -->
+    <div id="stage"><canvas id="c" width="320" height="320"></canvas></div>
+    <script type="module" src="/src/cinematic-harness.ts"></script>
+  </body>
+</html>

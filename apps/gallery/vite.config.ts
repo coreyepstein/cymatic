@@ -24,6 +24,9 @@ export default defineConfig({
         "generative-harness": fileURLToPath(new URL("./generative-harness.html", import.meta.url)),
         // The V2-13 cinematic particle verification harness (e2e, not user-facing).
         "particle-harness": fileURLToPath(new URL("./particle-harness.html", import.meta.url)),
+        // The V2-15 cinematic verification harness — song-arc evolution, bloom,
+        // seed variation, perf (e2e, not user-facing).
+        "cinematic-harness": fileURLToPath(new URL("./cinematic-harness.html", import.meta.url)),
       },
     },
   },
