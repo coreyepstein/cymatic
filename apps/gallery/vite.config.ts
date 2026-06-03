@@ -18,6 +18,8 @@ export default defineConfig({
         "feedback-harness": fileURLToPath(new URL("./feedback-harness.html", import.meta.url)),
         // The V2-10 cinematic geometric verification harness (e2e, not user-facing).
         "geometric-harness": fileURLToPath(new URL("./geometric-harness.html", import.meta.url)),
+        // The V2-11 cinematic color-field verification harness (e2e, not user-facing).
+        "colorfield-harness": fileURLToPath(new URL("./colorfield-harness.html", import.meta.url)),
       },
     },
   },
