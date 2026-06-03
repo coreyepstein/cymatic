@@ -3,29 +3,56 @@
 [![CI](https://github.com/coreyepstein/cymatic/actions/workflows/ci.yml/badge.svg)](https://github.com/coreyepstein/cymatic/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-A tasteful, open-source web audio visualizer library. cymatic turns any audio —
-a media element, a live microphone, or a decoded buffer — into reactive visuals
-rendered on a `<canvas>`, and can also render a track to a **music video**
-offline, frame-for-frame.
+A tasteful, open-source **cinematic** web audio visualizer library. cymatic
+turns any audio — a media element, a live microphone, or a decoded buffer — into
+reactive visuals rendered on a `<canvas>`, and can also render a track to a
+**music video** offline, frame-for-frame.
 
-<!-- A hero GIF lives at docs/media/hero.gif — to be added. -->
+It is not just a spectrum bar chart: cymatic layers a glowing, bloom-lit
+substrate, an **auto-director** that evolves the look across a whole song, and
+mood-reactive analysis — so the visuals build, drop, and breathe with the music.
+
+<!-- A hero GIF lives at docs/media/hero.gif — to be added (captures pending). -->
 <!-- ![cymatic presets in motion](docs/media/hero.gif) -->
 
 ## Why cymatic
 
+- **Cinematic substrate.** A glowing visual layer built from gradients
+  (`drawGradientRect`), soft additive light (`drawGlow`), and strokes
+  (`drawLine`), with a post-processing chain (`setPostEffects`) for **bloom**,
+  **vignette**, **exposure**, and **feedback trails**. On WebGPU these run
+  through an HDR target so bright, audio-hot regions actually bloom; on WebGL
+  the post-FX gracefully no-op to a clean basic look.
+- **Auto-director.** A deterministic, real-time engine tracks where a track is
+  in its arc (intro → build → sustain → drop → breakdown → outro) and evolves
+  normalized macro signals — intensity, motion, bloom, density, contrast — over
+  the whole song, **crossfading between palettes** and slowly rotating hue on
+  every section change. Works for live mic *and* file playback (no precomputed
+  analysis). See [docs/cinematic-engine.md](docs/cinematic-engine.md).
+- **Mood-reactive analysis.** Beyond FFT bands / RMS / onset, the analyser
+  derives a smoothed `MoodVector` (energy, brightness, busyness, valence,
+  dynamics) and richer features (spectral centroid/rolloff/flux, tempo, beat
+  phase, onset density) that presets and the director react to.
+- **Parameter system.** Presets declare a typed `params` schema and wire each
+  knob to a binding — audio, director, LFO, seeded random, or manual. The live
+  gallery auto-renders a control panel from the schema, so every knob is
+  tweakable in real time and manual overrides always beat automation.
 - **WebGPU with a WebGL fallback.** A single backend-agnostic `Renderer` picks
   WebGPU when available and falls back to WebGL automatically. Presets target
-  the renderer and never branch on the backend.
+  the renderer and never branch on the backend. **Cinematic post-FX (bloom,
+  feedback) require WebGPU**; on WebGL you still get the full geometry, just the
+  basic (non-bloomed) look.
 - **Live and offline.** The same preset drives a real-time canvas (rAF clock)
   and a deterministic offline render (fixed `1/fps` clock) — so what you see
-  live is what you export.
-- **Agnostic core, thin React layer.** All audio analysis (FFT bands,
-  RMS/loudness, onset/beat detection) and rendering live in `@cymatic/core`.
-  `@cymatic/react` is a thin, SSR-safe wrapper: a `<Visualizer />` component and
-  hooks, nothing more.
-- **12 tasteful presets across 4 art directions.** Geometric, color-field,
-  generative, and particle packs — named for movements and techniques, never
-  artists or trademarks.
+  live is what you export. The director and params are pure and seedable, so an
+  offline render reproduces exactly.
+- **Agnostic core, thin React layer.** All audio analysis, the director, the
+  param system, and rendering live in `@cymatic/core`. `@cymatic/react` is a
+  thin, SSR-safe wrapper: a `<Visualizer />` component and hooks, nothing more.
+- **12 cinematic presets across 4 art directions.** Geometric, color-field,
+  generative, and particle packs — each samples color from the director's
+  crossfading palette and leans on glow + bloom — named for movements and
+  techniques, never artists or trademarks.
 - **In-browser export.** Render to mp4/webm via WebCodecs when available, or to
   a PNG sequence everywhere else, then mux the original audio back on with
   ffmpeg.
@@ -60,6 +87,24 @@ export function MyVisualizer() {
   return <Visualizer preset={preset} microphone />;
 }
 ```
+
+The **auto-director is on by default** — the look evolves over the track with
+no extra wiring. It's optional and fully controllable:
+
+```tsx
+// Toggle the director off (presets fall back to audio / manual params), and
+// seed its deterministic drift so the generated look is reproducible. Changing
+// the seed re-rolls the look live, without tearing down the engine.
+<Visualizer preset={preset} microphone directorEnabled directorSeed={42} />
+
+// Read the live director macro state each frame (for a HUD / debug overlay).
+<Visualizer preset={preset} src="/track.mp3" onDirectorState={(d) => {
+  // d.section / d.intensity / d.bloom / d.paletteBlend / d.hueRotation …
+}} />
+```
+
+> Cinematic post-FX (bloom, feedback trails) light up on **WebGPU**; on the
+> WebGL fallback the same presets render their full geometry without the bloom.
 
 Other audio inputs (provide exactly one):
 
@@ -173,7 +218,10 @@ ffmpeg -framerate 60 -i frames/frame-%05d.png -i input.wav \
 
 ## Preset gallery
 
-Twelve presets across four art directions (resolve any by `id`):
+Twelve cinematic presets across four art directions (resolve any by `id`). Every
+preset samples color from the director's crossfading palette and exposes a
+`params` schema, so its look both evolves with the song and is live-tweakable in
+the gallery's control panel:
 
 ### Geometric — Swiss / Bauhaus
 
@@ -210,14 +258,16 @@ Twelve presets across four art directions (resolve any by `id`):
 `@cymatic/presets` also exports `allPresets` (every definition in display order)
 and `presetIds` (their ids) for building your own picker.
 
-<!-- Per-preset preview GIFs belong under docs/media/<preset-id>.gif — to be added. -->
+<!-- Per-preset preview GIFs belong under docs/media/<preset-id>.gif — to be added (captures pending). -->
 
 ## Docs
 
+- [Cinematic engine](docs/cinematic-engine.md) — how the four layers
+  (substrate/post-FX, audio + mood, director, params) fit together.
 - [Getting started](docs/getting-started.md) — install, live mode (audio
-  element + microphone), and a first visualizer.
-- [Authoring a preset](docs/authoring-a-preset.md) — `definePreset`,
-  `composePreset`, the primitives, and audio bindings.
+  element + microphone), cinematic effects, and the auto-director.
+- [Authoring a preset](docs/authoring-a-preset.md) — `composePreset`, the
+  cinematic primitives, post-FX, the director palette, and the `params` schema.
 - [Offline render](docs/offline-render.md) — the export API and the ffmpeg mux
   steps for a music video.
 - [Releasing](docs/releasing.md) — the changeset → version → tag → CI-publish
