@@ -22,6 +22,8 @@ export default defineConfig({
         "colorfield-harness": fileURLToPath(new URL("./colorfield-harness.html", import.meta.url)),
         // The V2-12 cinematic generative verification harness (e2e, not user-facing).
         "generative-harness": fileURLToPath(new URL("./generative-harness.html", import.meta.url)),
+        // The V2-13 cinematic particle verification harness (e2e, not user-facing).
+        "particle-harness": fileURLToPath(new URL("./particle-harness.html", import.meta.url)),
       },
     },
   },

@@ -1,15 +1,19 @@
 /**
- * Particle / fluid / 3D preset pack for @cymatic/presets.
+ * Particle / fluid / 3D preset pack for @cymatic/presets — cinematic rebuild
+ * (V2-13).
  *
- * Presets that evolve physical-ish state — a bounded particle system, a coarse
- * advected dye field, and a perspective-projected rotating point cloud — and
- * visualize it as many small rects. All built purely from the public
- * `@cymatic/core` primitive + Renderer surface (no raw WebGL/WebGPU). Every
- * preset uses a seeded PRNG (mulberry32) instead of `Math.random()`/`Date`, so
- * the same seed plus the same audio/time inputs reproduce an identical draw set
- * — reproducible and unit-testable. Each exposes a configurable, hard-capped
- * budget (particle count / grid size / point count) so it stays smooth at
- * typical resolution. Names reference technique, never people or trademarks.
+ * This pack is MADE for glow + trails + bloom: a PARTICLE system drawn as
+ * additive glow points that smear into luminous comet tails, a FLUID dye field
+ * rendered as glowing gradient cells + glow cores, and a LIGHT 3D point cloud
+ * projected (pure math, no 3D lib) to additive glows whose depth drives
+ * brightness/size. All built from the public `@cymatic/core` primitive +
+ * Renderer surface (gradient/glow/blend/post-FX) — no raw WebGL/WebGPU. Color is
+ * sampled from the auto-director's crossfading palette + slow hue rotation (so it
+ * evolves over a track); every preset uses a seeded PRNG (mulberry32) folded with
+ * the director's per-section seed, so the same inputs+seed reproduce an identical
+ * draw set AND each section reseeds fresh — never `Math.random()` / `Date.now`.
+ * Each preset is hard-capped (particle/point count, grid size) so it stays
+ * smooth. Names reference technique, never people or trademarks.
  */
 
 import type { PresetDefinition, PresetRegistry } from "@cymatic/core";
@@ -44,11 +48,15 @@ export {
   MAX_POINTS_LIMIT,
   type Light3dOptions,
 } from "./light-3d.js";
-// Note: the seeded PRNG (`mulberry32`) and `DEFAULT_SEED` are intentionally NOT
-// re-exported here — the generative pack already surfaces them on the package's
-// public API, and re-exporting would make those names ambiguous under the
-// top-level `export *`. The particle-specific helpers below are unique.
-export { decayFactor, advanceBurst, clampCount } from "./common.js";
+// Pack-specific helpers. Names already exported by another pack via the package
+// barrel (`mulberry32`, `DEFAULT_SEED`, `sectionSeed` from generative;
+// `directorColor`, `paletteForIndex`, `hot`, `dim` from geometric; `BeatSwell`,
+// `decaySwell` from color-field) are intentionally NOT re-exported here: the
+// package barrel `export *`s every pack, so re-exporting a shared name from a
+// second pack would create an ambiguous duplicate. Tests import those from
+// `./common.js` directly. `decayFactor`, `clampCount`, `particlePostFx` are
+// unique to this pack.
+export { decayFactor, clampCount, particlePostFx } from "./common.js";
 
 /** Every preset in the particle pack, in display order. */
 export const particlePresets: readonly PresetDefinition[] = [
