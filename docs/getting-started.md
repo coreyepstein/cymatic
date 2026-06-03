@@ -10,9 +10,10 @@ element and the microphone.
 pnpm add @cymatic/core @cymatic/react @cymatic/presets
 ```
 
-- **`@cymatic/core`** — the engine: audio analysis (FFT bands, RMS, onset/beat
-  detection), the backend-agnostic renderer, primitives, and the preset
-  contract.
+- **`@cymatic/core`** — the engine: audio + mood analysis (FFT bands, RMS,
+  onset/beat detection, spectral features, `MoodVector`), the backend-agnostic
+  renderer with cinematic primitives + post-FX, the auto-director, the parameter
+  system, and the preset contract.
 - **`@cymatic/react`** — a thin, SSR-safe React wrapper: the `<Visualizer />`
   component plus the `useVisualizer` / `useAudioFeatures` hooks.
 - **`@cymatic/presets`** — the bundled preset packs. Importing it registers
@@ -135,6 +136,66 @@ an `onFeatures` callback. It fires once per rendered frame with the current
 For a declarative read (re-renders each frame), use the `useVisualizer` /
 `useAudioFeatures` hooks directly instead of the component.
 
+## Cinematic effects + the auto-director
+
+cymatic's presets are cinematic by default: a glowing, bloom-lit substrate plus
+an **auto-director** that evolves the look across a whole song (building and
+dropping with the music, crossfading palettes on section changes). None of this
+needs extra wiring — just mount a preset with audio.
+
+The director is **on by default**. You control it with three optional props:
+
+```tsx
+import { Visualizer } from "@cymatic/react";
+import { defaultPresetRegistry } from "@cymatic/core";
+import "@cymatic/presets";
+
+const preset = defaultPresetRegistry.create("geometric.op-grid");
+
+export function Cinematic() {
+  return (
+    <Visualizer
+      preset={preset}
+      src="/track.mp3"
+      directorEnabled       // default true; set false to fall back to audio/manual params
+      directorSeed={42}     // seeds the deterministic drift; change it to re-roll the look live
+      onDirectorState={(d) => {
+        // d.section ("intro" | "build" | … | "outro"), d.intensity, d.bloom,
+        // d.motion, d.density, d.paletteBlend, d.hueRotation — for a HUD/overlay.
+      }}
+    />
+  );
+}
+```
+
+- `directorEnabled` — toggle the director without tearing down the engine. When
+  off, presets fall back to their audio / manual param bindings.
+- `directorSeed` — seeds the director's deterministic palette/drift generators.
+  Changing it reseeds live (no teardown), so the generated look re-rolls.
+- `onDirectorState` — fires once per frame with the current `DirectorState`.
+
+> **WebGPU vs WebGL.** Cinematic post-FX (bloom, feedback trails) run on
+> **WebGPU**. On the WebGL fallback the same presets render their full geometry
+> and color, just without the bloom — a clean basic look. The renderer picks the
+> backend for you; you can force one for testing via the `renderer` prop
+> (`renderer={{ backend: "webgl" }}`).
+
+### Live parameter controls
+
+Every preset exposes a typed `params` schema. Read the preset's `ParamSet` off
+the visualizer's `ref` to build your own controls (the gallery does exactly
+this):
+
+```tsx
+import { useRef } from "react";
+import { Visualizer, type VisualizerRef } from "@cymatic/react";
+
+const ref = useRef<VisualizerRef>(null);
+// After mount: ref.current?.paramSet is the active preset's ParamSet (or null).
+// const schema = ref.current?.paramSet?.getSchema();
+// ref.current?.paramSet?.setManual("glowIntensity", 0.9); // manual beats automation
+```
+
 ## Inputs at a glance
 
 Provide **exactly one** of these (or none for an idle preview):
@@ -148,8 +209,11 @@ Provide **exactly one** of these (or none for an idle preview):
 
 ## Next steps
 
-- [Authoring a preset](./authoring-a-preset.md) — build your own visuals with
-  `definePreset` / `composePreset` and the primitives.
+- [Cinematic engine](./cinematic-engine.md) — how the substrate/post-FX, audio +
+  mood analysis, director, and param layers fit together.
+- [Authoring a preset](./authoring-a-preset.md) — build your own cinematic
+  visuals with `composePreset`, the director palette, post-FX, and a `params`
+  schema.
 - [Offline render](./offline-render.md) — export a track to a music video.
 - The [`apps/gallery`](../apps/gallery) app is a full working example (preset
   switcher + drag-and-drop audio + mic).

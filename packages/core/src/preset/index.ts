@@ -10,6 +10,7 @@
 export type {
   Preset,
   PresetContext,
+  PresetFrameContext,
   PresetMeta,
   PresetDefinition,
   DefinePresetInput,

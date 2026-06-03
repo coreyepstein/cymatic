@@ -12,12 +12,19 @@ export {
   clamp01,
   computeBands,
   computeRms,
+  crestFactor,
   ema,
+  estimateTempo,
   logBandEdges,
+  spectralCentroid,
+  spectralRolloff,
 } from "./features.js";
 
 export type { BeatDetectorOptions } from "./beat-detector.js";
 export { BeatDetector, spectralFlux } from "./beat-detector.js";
+
+export type { MoodVector, MoodOptions } from "./mood.js";
+export { ZERO_MOOD, computeMood } from "./mood.js";
 
 export type { AnalyserOptions } from "./analyser.js";
 export { AudioAnalyser } from "./analyser.js";

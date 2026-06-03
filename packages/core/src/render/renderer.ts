@@ -22,17 +22,20 @@ import {
   type RendererBackend,
   type RendererEnvironment,
 } from "./capabilities.js";
-import {
-  WebglRenderer,
-  type WebglCanvasLike,
-} from "./webgl/webgl-renderer.js";
+import { WebglRenderer, type WebglCanvasLike } from "./webgl/webgl-renderer.js";
 import {
   WebgpuRenderer,
   type GpuNavigatorLike,
   type WebgpuCanvasLike,
 } from "./webgpu/webgpu-renderer.js";
 
-/** An RGBA color with channels in the `[0, 1]` range. */
+/**
+ * An RGBA color. Channels are nominally in `[0, 1]`, but values ABOVE `1` are
+ * intentionally allowed (HDR): on WebGPU the scene draws into an `rgba16float`
+ * target, so a glow at `intensity > 1` blooms. WebGL clamps to `[0, 1]` for its
+ * solid-color approximation. Producers that want a clamped color use
+ * {@link toRgba}; the draw primitives accept raw HDR values as-is.
+ */
 export interface RgbaColor {
   r: number;
   g: number;
@@ -40,6 +43,21 @@ export interface RgbaColor {
   /** Alpha, defaults to fully opaque when omitted by a producer. */
   a: number;
 }
+
+/**
+ * How a primitive's color combines with what is already in the frame.
+ *
+ * - `"alpha"` (default): standard source-over alpha blending. New draws sit on
+ *   top, respecting their alpha.
+ * - `"additive"`: the primitive's color is ADDED to the destination. Essential
+ *   for glow / light accumulation — overlapping glows brighten toward (and past)
+ *   white, which on WebGPU's HDR target is exactly what bloom feeds on.
+ *
+ * Set via {@link Renderer.setBlendMode}; it applies to every primitive issued
+ * afterwards within the frame until changed again. Backend-agnostic: presets
+ * never branch on the backend to pick a blend mode.
+ */
+export type BlendMode = "alpha" | "additive";
 
 /**
  * A backend-agnostic description of what to draw for a frame. For this story a
@@ -72,6 +90,109 @@ export interface DrawingBufferSize {
 }
 
 /**
+ * Backend-agnostic configuration for the post-processing chain.
+ *
+ * This is the single knob preset/React code uses to drive cinematic effects;
+ * it NEVER branches on the concrete backend. The WebGPU backend honours these
+ * fields by routing the scene through an offscreen HDR target and a chain of
+ * fullscreen passes; the WebGL backend treats this as a no-op (basic look).
+ *
+ * The shape is intentionally open for extension: later cinematic stories add
+ * `bloom`, `vignette`, `trails`, etc. as further optional fields without
+ * changing this method's contract. All fields are optional so a partial config
+ * merges onto the renderer's current state — only the keys present are updated.
+ */
+export interface PostEffectsConfig {
+  /**
+   * Exposure multiplier applied before tonemapping in the final composite
+   * stage. `1.0` is neutral; higher values brighten, lower darken. Clamped to
+   * a non-negative finite value by the backend.
+   */
+  exposure?: number;
+  /**
+   * Bloom: a bright-pass + separable Gaussian blur on a downsampled mip chain,
+   * composited additively back over the HDR scene before tonemap. This is what
+   * makes bright / audio-hot regions glow. Reads the HDR (`rgba16float`) target
+   * so highlights above `threshold` bleed. WebGPU honours this; WebGL no-ops.
+   */
+  bloom?: BloomConfig;
+  /**
+   * Vignette: a subtle darkening toward the frame edges, applied in the final
+   * composite/tonemap pass. WebGPU honours this; WebGL no-ops.
+   */
+  vignette?: VignetteConfig;
+  /**
+   * Feedback / trail buffer: blends the PREVIOUS frame (a persistent HDR
+   * "history" texture) into the current scene with a per-frame decay before
+   * bloom + tonemap, so moving glows/shapes leave luminous tails. The combined
+   * result is then stored back into history for the next frame. WebGPU honours
+   * this; WebGL no-ops. Disabled by default — presets opt in.
+   */
+  feedback?: FeedbackConfig;
+}
+
+/** Bloom-stage configuration. All fields optional; merged onto current state. */
+export interface BloomConfig {
+  /** Whether the bloom stage runs at all. */
+  enabled?: boolean;
+  /**
+   * Luminance threshold for the bright-pass: only scene luminance above this
+   * contributes to bloom. Clamped to `>= 0` by the backend. ~0.7 is cinematic.
+   */
+  threshold?: number;
+  /**
+   * How strongly the blurred bloom is added back over the scene. Clamped to
+   * `>= 0`. ~0.6 is a tasteful default.
+   */
+  intensity?: number;
+  /**
+   * Blur spread multiplier applied to the per-mip Gaussian sample step. `1.0`
+   * is the natural mip-scaled radius; higher widens the glow. Clamped to `>= 0`.
+   */
+  radius?: number;
+}
+
+/**
+ * Feedback / trail-buffer configuration. All fields optional; merged onto
+ * current state.
+ *
+ * When enabled, the renderer keeps a persistent HDR "history" texture of the
+ * previous frame's combined output. Each frame, that history is composited into
+ * the current scene scaled by {@link decay} — `combined = scene + history *
+ * decay` — so prior frames fade out geometrically over time, leaving motion
+ * trails. The combined result feeds bloom + tonemap as usual and is then stored
+ * back into history for the next frame. Two textures ping-pong to avoid a
+ * read/write hazard.
+ *
+ * The trail is a PURE function of prior frames and {@link decay}, so the offline
+ * (fixed-fps) render path stays deterministic: identical inputs produce
+ * identical output across runs.
+ */
+export interface FeedbackConfig {
+  /** Whether the feedback / trail stage runs at all. Default `false`. */
+  enabled?: boolean;
+  /**
+   * Per-frame retention of the previous frame, in `[0, 1)`. `0` keeps no
+   * history (no trail); values near `1` (e.g. `0.9`) leave long, slowly-fading
+   * tails. Clamped to `[0, 0.999]` by the backend so trails always eventually
+   * decay (a decay of exactly `1` would never fade and could accumulate
+   * unboundedly). Default `0.9`.
+   */
+  decay?: number;
+}
+
+/** Vignette-stage configuration. All fields optional; merged onto current state. */
+export interface VignetteConfig {
+  /** Whether the vignette darkening runs at all. */
+  enabled?: boolean;
+  /**
+   * How strongly the edges are darkened, in `[0, 1]`. `0` is no darkening; the
+   * backend clamps out-of-range values. ~0.35 is a subtle cinematic default.
+   */
+  amount?: number;
+}
+
+/**
  * An axis-aligned rectangle expressed in normalized device coordinates: the
  * frame spans `x: [0, 1]` (left→right) and `y: [0, 1]` (top→bottom), so the
  * surface is resolution-independent and presets never deal in pixels. `w`/`h`
@@ -88,6 +209,80 @@ export interface NormalizedRect {
   /** Height, normalized `[0, 1]`. */
   h: number;
   /** Fill color. */
+  color: RgbaColor;
+}
+
+/**
+ * A gradient fill spanning a {@link NormalizedRect}. Exactly one of
+ * {@link GradientFill.angle} (linear) or {@link GradientFill.radial} (radial) is
+ * honoured; when both are omitted the gradient is a left→right linear ramp.
+ *
+ * The ramp interpolates {@link from} → {@link to} in RGBA, HDR values allowed.
+ */
+export interface GradientFill {
+  /** Color at the start of the ramp (`t = 0`). */
+  from: RgbaColor;
+  /** Color at the end of the ramp (`t = 1`). */
+  to: RgbaColor;
+  /**
+   * Linear gradient direction, in RADIANS, measured clockwise from the +x axis
+   * within the rect's normalized space (`0` = left→right, `π/2` = top→bottom).
+   * Ignored when {@link radial} is set. Defaults to `0`.
+   */
+  angle?: number;
+  /**
+   * When `true`, the gradient is RADIAL: `from` at the rect's center, `to` at
+   * its farthest corner. Takes precedence over {@link angle}.
+   */
+  radial?: boolean;
+}
+
+/**
+ * A soft, feathered additive glow blob — the workhorse primitive for particles
+ * and light. Centered at ({@link x}, {@link y}) in normalized coords with a
+ * normalized {@link radius}. Falloff is a smooth gaussian-like curve from the
+ * center (full) to the edge (zero), so it reads as a soft light rather than a
+ * hard disc.
+ *
+ * The {@link color} is scaled by {@link intensity} (HDR): an intensity above `1`
+ * pushes the core above white so WebGPU's bloom picks it up. Glows are drawn
+ * additively regardless of the current blend mode is irrelevant here — a glow is
+ * inherently additive light; see {@link Renderer.drawGlow}.
+ */
+export interface GlowSpec {
+  /** Center X, normalized `[0, 1]`. */
+  x: number;
+  /** Center Y, normalized `[0, 1]`. */
+  y: number;
+  /** Radius, normalized (fraction of frame). The falloff reaches zero here. */
+  radius: number;
+  /** Base color of the glow (HDR allowed). */
+  color: RgbaColor;
+  /**
+   * Brightness multiplier applied to {@link color}. `1` is neutral; higher
+   * values push the core into HDR so bloom blooms it. Defaults to `1`.
+   */
+  intensity?: number;
+}
+
+/**
+ * A straight line segment from ({@link x0}, {@link y0}) to ({@link x1},
+ * {@link y1}) in normalized coords, stroked with {@link width} (normalized) and
+ * {@link color} (HDR allowed). On WebGPU the segment is a quad expanded along
+ * its normal; on WebGL it is approximated by a thin rect.
+ */
+export interface LineSpec {
+  /** Start X, normalized `[0, 1]`. */
+  x0: number;
+  /** Start Y, normalized `[0, 1]`. */
+  y0: number;
+  /** End X, normalized `[0, 1]`. */
+  x1: number;
+  /** End Y, normalized `[0, 1]`. */
+  y1: number;
+  /** Stroke width, normalized (fraction of frame). */
+  width: number;
+  /** Stroke color (HDR allowed). */
   color: RgbaColor;
 }
 
@@ -142,8 +337,54 @@ export interface Renderer {
    */
   drawRect(rect: NormalizedRect): void;
 
+  /**
+   * Set the blend mode for primitives issued AFTER this call within the current
+   * frame. Defaults to `"alpha"` at every {@link beginFrame}. `"additive"`
+   * accumulates light (overlapping draws brighten), which is what glow / light
+   * presets want. Backend-agnostic — presets never inspect {@link backend}.
+   *
+   * Note {@link drawGlow} is always additive by nature (it is light) regardless
+   * of this setting; this mode governs {@link drawRect}, {@link drawGradientRect}
+   * and {@link drawLine}.
+   */
+  setBlendMode(mode: BlendMode): void;
+
+  /**
+   * Draw an axis-aligned rectangle filled with a linear or radial color ramp
+   * ({@link GradientFill}). Must be called between {@link beginFrame} and
+   * {@link endFrame}. On WebGPU this is a real per-pixel gradient in the
+   * fragment shader; on WebGL it is a tasteful banded solid-color approximation.
+   */
+  drawGradientRect(rect: NormalizedRect, fill: GradientFill): void;
+
+  /**
+   * Draw a soft, feathered additive glow ({@link GlowSpec}) — the workhorse for
+   * particles and light. On WebGPU this is a feathered radial-falloff quad drawn
+   * additively into the HDR target (so bloom picks up bright cores); on WebGL it
+   * is approximated by a solid disc/rect with additive blending where possible.
+   */
+  drawGlow(glow: GlowSpec): void;
+
+  /**
+   * Draw a stroked line segment ({@link LineSpec}). On WebGPU the segment is a
+   * quad expanded along its normal by `width`; on WebGL it is a thin rect
+   * approximation. Respects the current blend mode.
+   */
+  drawLine(line: LineSpec): void;
+
   /** Close the frame opened by {@link beginFrame}, submitting all draws. */
   endFrame(): void;
+
+  /**
+   * Configure the post-processing chain. Backend-agnostic: presets/React call
+   * this without ever inspecting {@link backend}. Fields present in `config`
+   * update the renderer's post-FX state; omitted fields are left unchanged.
+   *
+   * WebGPU routes the scene through an offscreen HDR target and applies the
+   * configured stages (tonemap + exposure today, more later). WebGL implements
+   * this as a no-op and keeps its direct-render basic look.
+   */
+  setPostEffects(config: PostEffectsConfig): void;
 
   /** Release GPU/GL resources. Idempotent. */
   dispose(): void;
@@ -187,6 +428,117 @@ function clampChannel(value: number | undefined): number {
   if (value < 0) return 0;
   if (value > 1) return 1;
   return value;
+}
+
+/** A 2D point in normalized space. */
+export interface Vec2 {
+  x: number;
+  y: number;
+}
+
+/**
+ * Expand a line segment into the four corners of the quad that strokes it.
+ *
+ * Pure geometry shared by both backends so the normal/expansion math lives in
+ * one tested place. Given endpoints `(x0,y0)→(x1,y1)` and a stroke `width`, the
+ * quad is the segment offset by `±width/2` along the segment's unit normal.
+ * Corner order is `[start-left, start-right, end-left, end-right]` where "left"
+ * is `+normal`. A degenerate (zero-length) segment falls back to a horizontal
+ * normal so it still produces a (thin) visible quad rather than NaNs.
+ *
+ * Coordinates are in the same normalized `[0,1]` space the segment is given in;
+ * callers map to clip/device space. Aspect-ratio correction (so a stroke is
+ * round, not stretched) is a backend concern, not this helper's.
+ */
+export function expandLineToQuad(
+  line: Pick<LineSpec, "x0" | "y0" | "x1" | "y1" | "width">,
+): [Vec2, Vec2, Vec2, Vec2] {
+  const dx = line.x1 - line.x0;
+  const dy = line.y1 - line.y0;
+  const len = Math.hypot(dx, dy);
+  // Unit direction; fall back to +x for a degenerate segment.
+  const ux = len > 1e-9 ? dx / len : 1;
+  const uy = len > 1e-9 ? dy / len : 0;
+  // Unit normal (rotate direction +90°): (-uy, ux).
+  const nx = -uy;
+  const ny = ux;
+  const hw = Math.max(line.width, 0) / 2;
+  const ox = nx * hw;
+  const oy = ny * hw;
+  return [
+    { x: line.x0 + ox, y: line.y0 + oy }, // start-left
+    { x: line.x0 - ox, y: line.y0 - oy }, // start-right
+    { x: line.x1 + ox, y: line.y1 + oy }, // end-left
+    { x: line.x1 - ox, y: line.y1 - oy }, // end-right
+  ];
+}
+
+/**
+ * Map a normalized coordinate (`[0,1]`, y-down, top-left origin) to clip space
+ * (`[-1,1]`, y-up). Shared NDC mapping so the scene's coordinate convention is
+ * defined in exactly one tested place.
+ */
+export function normalizedToClip(nx: number, ny: number): Vec2 {
+  return { x: nx * 2 - 1, y: 1 - ny * 2 };
+}
+
+/**
+ * The axis-aligned bounding rect (normalized) of a stroked line segment — used
+ * by the WebGL approximation to place a thin solid rect. Returns the tight
+ * bounds of the expanded quad.
+ */
+export function lineBoundsRect(line: Pick<LineSpec, "x0" | "y0" | "x1" | "y1" | "width">): {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+} {
+  const corners = expandLineToQuad(line);
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const c of corners) {
+    if (c.x < minX) minX = c.x;
+    if (c.y < minY) minY = c.y;
+    if (c.x > maxX) maxX = c.x;
+    if (c.y > maxY) maxY = c.y;
+  }
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+/**
+ * The per-frame feedback / trail recurrence, as a pure function: given the
+ * `scene` luminance/color value rendered THIS frame and the `history` value
+ * retained from the PREVIOUS frame, the combined output is
+ * `scene + history * decay`. This is exactly what the WebGPU feedback-composite
+ * shader computes per channel; modelling it here gives the trail a single
+ * tested definition AND lets the offline (fixed-fps) determinism check prove the
+ * sequence is a pure function of prior frames + decay (no time/RNG), so two runs
+ * with identical inputs produce identical output. `decay` is clamped to
+ * `[0, 0.999]` so trails always eventually fade.
+ */
+export function feedbackCombine(scene: number, history: number, decay: number): number {
+  const d = Number.isFinite(decay) ? Math.min(Math.max(decay, 0), 0.999) : 0.9;
+  return scene + history * d;
+}
+
+/**
+ * Run the feedback recurrence over a sequence of per-frame `scene` values,
+ * returning the combined (trail-accumulated) value at each frame. Frame `i`'s
+ * output is `scene[i] + decay * output[i-1]` (history starts at 0). Pure: no
+ * time, no RNG — so the offline path is deterministic across runs. Used by the
+ * determinism unit test and as the reference the GPU path mirrors.
+ */
+export function feedbackSequence(scene: readonly number[], decay: number): number[] {
+  const out: number[] = [];
+  let history = 0;
+  for (const s of scene) {
+    const combined = feedbackCombine(s, history, decay);
+    out.push(combined);
+    history = combined;
+  }
+  return out;
 }
 
 /** A canvas usable by either backend (the union of both backends' needs). */
@@ -240,34 +592,27 @@ export function createRenderer(
       // (GpuNavigatorLike) at this single boundary — both are minimal views of
       // `navigator.gpu`, so the cast (via the GpuLike alias, no `any`) is sound.
       const envGpu: GpuLike | null | undefined = environment.gpu;
-      const gpu =
-        opts.gpu ?? (envGpu as GpuNavigatorLike | null | undefined) ?? undefined;
+      const gpu = opts.gpu ?? (envGpu as GpuNavigatorLike | null | undefined) ?? undefined;
       if (!gpu) {
         // No usable `gpu` entrypoint. If WebGPU was explicitly forced by the
         // caller, honour the strict contract and throw. Otherwise this is the
         // auto-selection path: degrade gracefully to WebGL when it is available
         // rather than failing the whole renderer.
         if (opts.backend === "webgpu") {
-          throw new Error(
-            "createRenderer: WebGPU selected but no `gpu` entrypoint was provided.",
-          );
+          throw new Error("createRenderer: WebGPU selected but no `gpu` entrypoint was provided.");
         }
         const hasWebgl = environment.hasWebgl ?? defaultHasWebgl;
         if (hasWebgl()) {
           return new WebglRenderer({ canvas });
         }
-        throw new Error(
-          "createRenderer: WebGPU selected but no `gpu` entrypoint was provided.",
-        );
+        throw new Error("createRenderer: WebGPU selected but no `gpu` entrypoint was provided.");
       }
       return new WebgpuRenderer({ canvas, gpu });
     }
     case "webgl":
       return new WebglRenderer({ canvas });
     case "none":
-      throw new Error(
-        "createRenderer: no rendering backend available (neither WebGPU nor WebGL).",
-      );
+      throw new Error("createRenderer: no rendering backend available (neither WebGPU nor WebGL).");
     default: {
       const exhaustive: never = selection;
       throw new Error(`createRenderer: unhandled backend selection ${String(exhaustive)}`);

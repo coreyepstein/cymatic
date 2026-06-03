@@ -1,23 +1,47 @@
 /**
- * Shared building blocks for the generative / algorithmic preset pack.
+ * Shared cinematic building blocks for the generative / algorithmic preset pack
+ * (V2-12 rebuild).
  *
- * Generative presets evolve internal state (particle positions, a reaction
- * grid, an accumulating plotter path) and visualize it as many small rects.
- * Two properties matter for this pack and are centralized here:
+ * The rebuilt generative pack is about *luminous algorithmic art*: particles
+ * advected through a noise field rendered as additive glow points that smear
+ * into long feedback trails (luminous ribbons), a reaction-diffusion bath whose
+ * concentration becomes glowing color, and a pen-plotter that inks glowing
+ * additive lines. Two properties from the original pack still matter and are
+ * centralized here:
  *
  *   - DETERMINISM: every preset seeds a small, dependency-free PRNG
  *     ({@link mulberry32}) instead of `Math.random()`, so the same seed plus the
- *     same audio/time inputs reproduce an identical draw set — reproducible and
- *     unit-testable across runs.
+ *     same audio/director/time inputs reproduce an identical draw set —
+ *     reproducible and unit-testable across runs. The director's per-section
+ *     {@link "@cymatic/core".DirectorState.seed} is folded in via
+ *     {@link sectionSeed} so each section RE-SEEDS the generator and looks fresh
+ *     (no `Math.random` / `Date.now`).
  *   - A SMOOTH NOISE FIELD: a cheap, deterministic value-noise sampler
  *     ({@link valueNoise2D}) used to advect particles, so the flow field is
  *     organic without pulling in a noise dependency.
+ *
+ * On top of that it adds the V2 *cinematic* surface shared by every pack: color
+ * sampled from the director's crossfading palette + slow hue rotation
+ * ({@link directorColor}), HDR helpers ({@link hot} / {@link dim}) to push glow
+ * cores past white so bloom blooms them, a breathing beat envelope
+ * ({@link BeatSwell}), and the pack's post-FX defaults ({@link generativePostFx})
+ * — bloom + a long feedback trail so glow points leave luminous ribbons.
  *
  * Everything here is pure / Node-testable and built only on the public
  * `@cymatic/core` surface (no raw WebGL/WebGPU).
  */
 
-import { clamp01 } from "@cymatic/core";
+import {
+  clamp01,
+  mixColor,
+  palettes,
+  PALETTE_CATALOG,
+  rotateHue,
+  sampleBlended,
+  type DirectorState,
+  type Palette,
+  type RgbaColor,
+} from "@cymatic/core";
 
 /**
  * A small, fast, deterministic PRNG (mulberry32). Given a 32-bit integer seed it
@@ -38,6 +62,24 @@ export function mulberry32(seed: number): () => number {
 
 /** The default seed every generative preset uses unless told otherwise. */
 export const DEFAULT_SEED = 0x9e3779b9;
+
+/**
+ * Fold a preset's base `seed` together with the director's per-section `seed`
+ * into a single 32-bit seed. The director re-seeds on every section change, so
+ * combining it here makes each section RE-SEED a preset's generator — the same
+ * preset looks materially fresh per section (different particle layout / reaction
+ * nuclei / plotter figure) while staying fully deterministic given the inputs.
+ * Pure + exported so a test can assert that two different director seeds yield a
+ * different combined seed (and thus a different pattern).
+ */
+export function sectionSeed(base: number, directorSeed: number): number {
+  // xorshift-mix the two seeds so neither dominates and small director-seed
+  // deltas fully decorrelate the stream.
+  let h = (base ^ Math.imul(directorSeed | 0, 0x9e3779b1)) >>> 0;
+  h = Math.imul(h ^ (h >>> 16), 0x21f0aaad);
+  h = Math.imul(h ^ (h >>> 15), 0x735a2d97);
+  return (h ^ (h >>> 15)) >>> 0;
+}
 
 /**
  * Deterministic 2D hash in `[0, 1)` for integer lattice coordinates, salted by
@@ -95,4 +137,129 @@ export function flowAngle(x: number, y: number, scale: number, seed = 0): number
 export function wrap01(v: number): number {
   const r = v - Math.floor(v);
   return r < 0 ? r + 1 : r;
+}
+
+// ---------------------------------------------------------------------------
+// Cinematic surface (shared with the geometric / color-field packs)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the director's `paletteIndex` into the catalog {@link Palette}, with a
+ * safe modulo so an out-of-range index never throws. The director's index space
+ * is the catalog order ({@link PALETTE_CATALOG}), so an index maps 1:1.
+ */
+export function paletteForIndex(index: number): Palette {
+  const n = PALETTE_CATALOG.length;
+  if (n === 0) return palettes.sunset;
+  const i = ((Math.trunc(index) % n) + n) % n;
+  return PALETTE_CATALOG[i] ?? palettes.sunset;
+}
+
+/**
+ * Sample a single evolving color from the director's state at ramp position `t`
+ * (`[0, 1]`). This is the heart of "color evolves over a song":
+ *   - it crossfades between the director's previous and target palettes by
+ *     `paletteBlend` (so a section change visibly shifts the family), and
+ *   - it rotates the resulting hue by `hueRotation` turns (a slow, continuous
+ *     drift), so the color is never fixed.
+ *
+ * Pure + exported so a test can assert that two different director states (a
+ * different `paletteBlend` / `hueRotation`) yield a materially different color.
+ */
+export function directorColor(director: DirectorState, t: number): RgbaColor {
+  const from = paletteForIndex(director.prevPaletteIndex);
+  const to = paletteForIndex(director.paletteIndex);
+  const base = sampleBlended(from, to, clamp01(director.paletteBlend), clamp01(t));
+  // `hueRotation` is in turns [0, 1); rotateHue takes degrees.
+  return rotateHue(base, director.hueRotation * 360);
+}
+
+/**
+ * Scale a color into HDR by `gain` (>1 pushes the core past white so the
+ * renderer's bloom picks it up). Keeps alpha. Pure helper used to feed
+ * `drawGlow` / additive draws their punch.
+ */
+export function hot(color: RgbaColor, gain: number): RgbaColor {
+  const g = gain > 0 ? gain : 0;
+  return { r: color.r * g, g: color.g * g, b: color.b * g, a: color.a };
+}
+
+/** Dim a color toward black by `amount` in `[0, 1]` (0 = unchanged). Keeps alpha. */
+export function dim(color: RgbaColor, amount: number): RgbaColor {
+  return mixColor(color, { r: 0, g: 0, b: 0, a: color.a }, clamp01(amount));
+}
+
+/**
+ * One step of the beat-swell envelope: when an onset fires the swell jumps
+ * toward 1, otherwise it decays exponentially toward 0 over `dt` seconds.
+ * `halfLife` is the seconds for the swell to halve. The decay is ADDED to the
+ * residual so rapid beats build a sustained glow rather than re-triggering a
+ * hard flash. Pure + exported so a test can assert it rises on a beat and decays
+ * gracefully (never snaps).
+ */
+export function decaySwell(current: number, onset: boolean, dt: number, halfLife = 0.45): number {
+  const safeDt = Number.isFinite(dt) && dt > 0 ? dt : 0;
+  const decay = halfLife > 0 ? Math.pow(0.5, safeDt / halfLife) : 0;
+  const decayed = current * decay;
+  return onset ? clamp01(decayed + 0.85) : clamp01(decayed);
+}
+
+/**
+ * A stateful beat-swell envelope. Feed it `(onset, dt)` each frame and read a
+ * smooth `[0, 1]` swell that rises on beats and decays gracefully between them.
+ * Wraps {@link decaySwell} so the envelope math lives in one place.
+ */
+export class BeatSwell {
+  private value: number;
+  private readonly halfLife: number;
+
+  constructor(halfLife = 0.45, initial = 0) {
+    this.halfLife = halfLife;
+    this.value = clamp01(initial);
+  }
+
+  /** Advance one frame and return the current swell. */
+  update(onset: boolean, dt: number): number {
+    this.value = decaySwell(this.value, onset, dt, this.halfLife);
+    return this.value;
+  }
+
+  /** Current swell without advancing. */
+  get current(): number {
+    return this.value;
+  }
+
+  /** Reset to `value`. */
+  reset(value = 0): void {
+    this.value = clamp01(value);
+  }
+}
+
+/**
+ * The post-FX defaults the generative pack installs when a preset becomes
+ * active. Generative art + glow/trails is the whole point of this pack, so this
+ * leans into bloom + a long (bounded) feedback trail: the additive glow points /
+ * lines smear into luminous RIBBONS over many frames. `bloomAmount` (from a
+ * param / the director) scales the bloom intensity so the glow builds and drops
+ * with the song; `trailDecay` controls how long the feedback ribbon lingers.
+ */
+export function generativePostFx(bloomAmount: number, trailDecay: number): {
+  exposure: number;
+  bloom: { enabled: boolean; threshold: number; intensity: number; radius: number };
+  vignette: { enabled: boolean; amount: number };
+  feedback: { enabled: boolean; decay: number };
+} {
+  const amt = clamp01(bloomAmount);
+  // Cap the trail decay so the HDR history can't accumulate toward a flat white —
+  // a long-but-bounded tail keeps the ribbon look while preserving palette hue.
+  const decay = Math.min(0.92, clamp01(trailDecay));
+  return {
+    exposure: 1.05,
+    // A punchy bloom: generative cores are small and bright, so a moderate
+    // threshold + strong intensity makes the points/lines bloom into halos.
+    bloom: { enabled: true, threshold: 0.6, intensity: 0.4 + amt * 1.1, radius: 1.5 },
+    vignette: { enabled: true, amount: 0.3 },
+    // Always on for this pack — the long (bounded) trail IS the luminous ribbon.
+    feedback: { enabled: true, decay },
+  };
 }

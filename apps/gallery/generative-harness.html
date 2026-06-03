@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>cymatic · generative harness</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #000;
+      }
+      #stage {
+        width: 256px;
+        height: 256px;
+      }
+      canvas {
+        display: block;
+        width: 256px;
+        height: 256px;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      V2-12 generative cinematic verification harness. Drives a generative preset
+      directly (no React) so a Playwright spec can assert glow/bloom presence and
+      that color evolves under an evolving director. Exposes `window.__genHarness`.
+    -->
+    <div id="stage"><canvas id="c" width="256" height="256"></canvas></div>
+    <script type="module" src="/src/generative-harness.ts"></script>
+  </body>
+</html>

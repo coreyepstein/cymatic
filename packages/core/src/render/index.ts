@@ -21,12 +21,30 @@ export type {
   Scene,
   RenderFeatures,
   RgbaColor,
+  BlendMode,
   NormalizedRect,
+  GradientFill,
+  GlowSpec,
+  LineSpec,
+  Vec2,
   DrawingBufferSize,
   RenderCanvasLike,
   CreateRendererOptions,
+  PostEffectsConfig,
+  BloomConfig,
+  VignetteConfig,
+  FeedbackConfig,
 } from "./renderer.js";
-export { createRenderer, computeDrawingBufferSize, toRgba } from "./renderer.js";
+export {
+  createRenderer,
+  computeDrawingBufferSize,
+  toRgba,
+  expandLineToQuad,
+  normalizedToClip,
+  lineBoundsRect,
+  feedbackCombine,
+  feedbackSequence,
+} from "./renderer.js";
 
 export type { WebglCanvasLike, WebglRendererOptions } from "./webgl/webgl-renderer.js";
 export { WebglRenderer } from "./webgl/webgl-renderer.js";

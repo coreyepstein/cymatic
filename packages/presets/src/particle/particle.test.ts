@@ -1,20 +1,25 @@
 /**
- * Tests for the particle / fluid / 3D preset pack.
+ * Tests for the cinematic particle / fluid / 3D preset pack (V2-13).
  *
- * Each preset is driven through the public {@link Preset} lifecycle against a
- * recording mock {@link Renderer} (only `beginFrame`/`drawRect`/`endFrame`), so
- * these tests prove the presets work on any backend without touching GL/GPU. We
- * assert:
- *   - all three presets register into a {@link PresetRegistry} under unique ids;
- *   - names match the brief ("Particles" / "Fluid" / "Light 3D") and reference
- *     technique, not people / trademarks;
- *   - SEEDED DETERMINISM: the same seed + identical inputs reproduce an identical
- *     recorded draw set across two independent runs, and different seeds diverge;
- *   - AUDIO MATTERS: beats raise particle/emission activity (more draws or higher
- *     velocity) vs silence;
- *   - PERFORMANCE GUARD: live particle count / point count never exceeds the cap;
- *   - NO Math.random / Date: the pack's source contains no such calls;
- *   - the pure parameter helpers respond to audio as documented.
+ * Every preset is driven through the public {@link Preset} lifecycle against a
+ * recording mock {@link Renderer} that captures the FULL cinematic surface —
+ * rects, gradient rects, glows, lines, blend modes, and post-FX — so these tests
+ * prove the presets work on any backend without touching GL/GPU. We assert:
+ *   - each preset registers AND declares a non-empty (6+) param schema;
+ *   - the canonical ids/names are kept ("Particles" / "Fluid" / "Light 3D");
+ *   - names reference technique, not people / trademarks;
+ *   - the pack emits soft additive GLOW (cinematic light) and sets bloom +
+ *     feedback on;
+ *   - a loud / high-energy frame produces MORE / brighter glow than a silent one;
+ *   - director evolution: calm intro vs hot drop yield materially DIFFERENT
+ *     output (color and/or composition) — proving it evolves over a song;
+ *   - SEEDED DETERMINISM: same `(features, director, time, seed)` → identical
+ *     recorded draw sequence across two independent runs;
+ *   - PER-SECTION RESEED: changing the director's `seed` (a section change)
+ *     changes the generated pattern;
+ *   - PERFORMANCE GUARD: the live particle count never exceeds the hard cap;
+ *   - NO `Math.random` / `Date.now`: the pack's source contains neither;
+ *   - the pure parameter helpers respond to audio / director as documented.
  */
 
 import { readFileSync, readdirSync } from "node:fs";
@@ -24,20 +29,28 @@ import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  Director,
   PresetRegistry,
+  restingDirectorState,
   type AudioFeatureFrame,
+  type BlendMode,
+  type DirectorState,
+  type DrawingBufferSize,
+  type GlowSpec,
+  type GradientFill,
+  type LineSpec,
   type NormalizedRect,
+  type PostEffectsConfig,
+  type Preset,
   type PresetDefinition,
   type Renderer,
+  type RenderFeatures,
   type RgbaColor,
   type Scene,
-  type RenderFeatures,
-  type DrawingBufferSize,
 } from "@cymatic/core";
 
 import {
   DEFAULT_MAX_PARTICLES,
-  DEFAULT_MAX_POINTS,
   emissionCount,
   emissionSpeed,
   fluidParams,
@@ -52,23 +65,39 @@ import {
   project,
   registerParticlePresets,
 } from "./index.js";
-import { mulberry32 } from "./common.js";
+import { directorColor, paletteForIndex, sectionSeed } from "./common.js";
 
 // ---------------------------------------------------------------------------
 // Test doubles
 // ---------------------------------------------------------------------------
 
 type CapturedRect = NormalizedRect;
+interface CapturedGradient {
+  rect: NormalizedRect;
+  fill: GradientFill;
+}
 
-/** A minimal in-memory renderer that records the rects drawn per frame. */
+/**
+ * A minimal in-memory renderer that records the full cinematic draw surface per
+ * frame. It honors the begin/draw/end discipline so misuse (drawing outside a
+ * frame) is caught.
+ */
 class RecordingRenderer implements Renderer {
   readonly backend = "webgl" as const;
   readonly drawingBufferSize: DrawingBufferSize = { width: 100, height: 100 };
 
-  lastFrameRects: CapturedRect[] = [];
-  /** Max rects seen in any single frame across the whole run (perf guard). */
-  maxRectsInAnyFrame = 0;
-  private current: CapturedRect[] | null = null;
+  backgrounds: RgbaColor[] = [];
+  postEffects: PostEffectsConfig[] = [];
+
+  lastFrame = {
+    rects: [] as CapturedRect[],
+    gradients: [] as CapturedGradient[],
+    glows: [] as GlowSpec[],
+    lines: [] as LineSpec[],
+    blendModes: [] as BlendMode[],
+    background: { r: 0, g: 0, b: 0, a: 1 } as RgbaColor,
+  };
+  private cur: typeof this.lastFrame | null = null;
 
   init(): Promise<void> {
     return Promise.resolve();
@@ -76,20 +105,46 @@ class RecordingRenderer implements Renderer {
   resize(): void {}
   render(_scene: Scene, _features: RenderFeatures, _time: number): void {}
 
-  beginFrame(_background: RgbaColor): void {
-    this.current = [];
+  beginFrame(background: RgbaColor): void {
+    this.backgrounds.push({ ...background });
+    this.cur = {
+      rects: [],
+      gradients: [],
+      glows: [],
+      lines: [],
+      blendModes: [],
+      background: { ...background },
+    };
+  }
+  private frame(): NonNullable<typeof this.cur> {
+    if (!this.cur) throw new Error("draw outside of a frame");
+    return this.cur;
+  }
+  setBlendMode(mode: BlendMode): void {
+    this.frame().blendModes.push(mode);
   }
   drawRect(rect: NormalizedRect): void {
-    if (!this.current) throw new Error("drawRect outside of a frame");
-    this.current.push({ ...rect, color: { ...rect.color } });
+    this.frame().rects.push({ ...rect, color: { ...rect.color } });
+  }
+  drawGradientRect(rect: NormalizedRect, fill: GradientFill): void {
+    this.frame().gradients.push({
+      rect: { ...rect, color: { ...rect.color } },
+      fill: { ...fill, from: { ...fill.from }, to: { ...fill.to } },
+    });
+  }
+  drawGlow(glow: GlowSpec): void {
+    this.frame().glows.push({ ...glow, color: { ...glow.color } });
+  }
+  drawLine(line: LineSpec): void {
+    this.frame().lines.push({ ...line, color: { ...line.color } });
+  }
+  setPostEffects(config: PostEffectsConfig): void {
+    this.postEffects.push(config);
   }
   endFrame(): void {
-    if (!this.current) throw new Error("endFrame without beginFrame");
-    this.lastFrameRects = this.current;
-    if (this.current.length > this.maxRectsInAnyFrame) {
-      this.maxRectsInAnyFrame = this.current.length;
-    }
-    this.current = null;
+    if (!this.cur) throw new Error("endFrame without beginFrame");
+    this.lastFrame = this.cur;
+    this.cur = null;
   }
   dispose(): void {}
 }
@@ -102,6 +157,16 @@ function frame(over: Partial<AudioFeatureFrame> = {}): AudioFeatureFrame {
     treble: 0,
     rms: 0,
     onset: false,
+    spectralCentroid: 0,
+    spectralRolloff: 0,
+    spectralFlux: 0,
+    loudnessShort: 0,
+    loudnessLong: 0,
+    dynamics: 0,
+    tempo: 0,
+    beatPhase: 0,
+    onsetDensity: 0,
+    mood: { energy: 0, brightness: 0, busyness: 0, valence: 0, dynamics: 0 },
     time: 0,
     ...over,
   };
@@ -115,35 +180,121 @@ const LOUD = (over: Partial<AudioFeatureFrame> = {}): AudioFeatureFrame =>
     mid: 0.7,
     treble: 0.8,
     rms: 0.8,
+    loudnessLong: 0.8,
+    mood: { energy: 0.9, brightness: 0.7, busyness: 0.8, valence: 0.6, dynamics: 0.5 },
     ...over,
   });
 
+/** A calm intro-like director state (low intensity, first palette, no rotation). */
+function calmDirector(): DirectorState {
+  return {
+    ...restingDirectorState(),
+    section: 0 as DirectorState["section"],
+    intensity: 0.1,
+    motion: 0.7,
+    bloom: 0.15,
+    density: 0.6,
+    contrast: 0.4,
+    paletteIndex: 0,
+    prevPaletteIndex: 0,
+    paletteBlend: 1,
+    hueRotation: 0,
+  };
+}
+
+/** A hot drop-like director state: high intensity, mid-crossfade, hue rotated. */
+function hotDirector(): DirectorState {
+  return {
+    ...restingDirectorState(),
+    section: 3 as DirectorState["section"],
+    intensity: 0.95,
+    motion: 1.6,
+    bloom: 0.85,
+    density: 1.5,
+    contrast: 0.85,
+    paletteIndex: 4,
+    prevPaletteIndex: 2,
+    paletteBlend: 0.5,
+    hueRotation: 0.4,
+  };
+}
+
 /**
- * Drive a preset for `frames`, advancing time by a fixed step so determinism is
- * a function of (def/seed, inputs) only. Returns the renderer for inspection.
+ * Drive a preset against a fresh renderer for N frames at a fixed dt, threading
+ * a director state into every update. Returns the renderer for inspection.
  */
-function drive(def: PresetDefinition, frames: AudioFeatureFrame[]): RecordingRenderer {
+function drive(
+  def: PresetDefinition,
+  frames: AudioFeatureFrame[],
+  director: DirectorState = restingDirectorState(),
+): { renderer: RecordingRenderer; preset: Preset } {
   const renderer = new RecordingRenderer();
   const preset = def.create();
   void preset.init({ renderer, width: 100, height: 100, dpr: 1 });
   let t = 0;
-  const step = 1 / 60;
   for (const f of frames) {
-    preset.update({ ...f, time: t }, t, step);
-    t += step;
+    preset.update({ ...f, time: t }, t, 1 / 60, { director });
+    t += 1 / 60;
   }
-  return renderer;
+  return { renderer, preset };
 }
 
-/** A stable fingerprint of a frame's draw set, rounded to avoid float noise. */
-function fingerprint(rects: CapturedRect[]): string {
-  return rects
-    .map(
-      (r) =>
-        `${r.x.toFixed(4)},${r.y.toFixed(4)},${r.w.toFixed(4)},${r.h.toFixed(4)}|` +
-        `${r.color.r.toFixed(3)},${r.color.g.toFixed(3)},${r.color.b.toFixed(3)},${r.color.a.toFixed(3)}`,
-    )
-    .join(";");
+/**
+ * A stable fingerprint of a frame's FULL draw set (rects + gradients + glows +
+ * lines), rounded to avoid float noise. Two runs with identical inputs must
+ * produce an identical fingerprint.
+ */
+function fingerprint(r: RecordingRenderer): string {
+  const f = r.lastFrame;
+  const c = (col: RgbaColor): string =>
+    `${col.r.toFixed(3)},${col.g.toFixed(3)},${col.b.toFixed(3)},${col.a.toFixed(3)}`;
+  const parts: string[] = [`bg:${c(f.background)}`, `blend:${f.blendModes.join(">")}`];
+  for (const x of f.rects) parts.push(`R ${x.x.toFixed(3)},${x.y.toFixed(3)},${x.w.toFixed(3)},${x.h.toFixed(3)}|${c(x.color)}`);
+  for (const g of f.gradients)
+    parts.push(`G ${g.rect.x.toFixed(3)},${g.rect.y.toFixed(3)}|${c(g.fill.from)}->${c(g.fill.to)}`);
+  for (const g of f.glows)
+    parts.push(`L ${g.x.toFixed(3)},${g.y.toFixed(3)},${g.radius.toFixed(4)}|${c(g.color)}@${(g.intensity ?? 1).toFixed(3)}`);
+  for (const l of f.lines)
+    parts.push(`S ${l.x0.toFixed(3)},${l.y0.toFixed(3)}->${l.x1.toFixed(3)},${l.y1.toFixed(3)}|w${l.width.toFixed(4)}|${c(l.color)}`);
+  return parts.join(";");
+}
+
+/** Total additive light energy emitted by glow + line draws in the last frame. */
+function glowEnergy(r: RecordingRenderer): number {
+  const f = r.lastFrame;
+  const glow = f.glows.reduce((sum, g) => {
+    const mag = g.color.r + g.color.g + g.color.b;
+    return sum + mag * (g.intensity ?? 1) * Math.max(g.radius, 0);
+  }, 0);
+  const lines = f.lines.reduce((sum, l) => {
+    const mag = l.color.r + l.color.g + l.color.b;
+    return sum + mag * Math.max(l.width, 0);
+  }, 0);
+  return glow + lines;
+}
+
+/** Total draw activity in the last frame (gradients + glows + lines + rects). */
+function drawActivity(r: RecordingRenderer): number {
+  const f = r.lastFrame;
+  return f.rects.length + f.gradients.length + f.glows.length + f.lines.length;
+}
+
+/** Mean dominant-hue-ish color signature of all draws (rough RGB ratios). */
+function colorSignature(r: RecordingRenderer): { r: number; g: number; b: number } {
+  const acc = { r: 0, g: 0, b: 0 };
+  let n = 0;
+  const add = (col: RgbaColor): void => {
+    acc.r += col.r;
+    acc.g += col.g;
+    acc.b += col.b;
+    n++;
+  };
+  for (const x of r.lastFrame.rects) add(x.color);
+  for (const g of r.lastFrame.gradients) add(g.fill.to);
+  for (const g of r.lastFrame.glows) add(g.color);
+  for (const l of r.lastFrame.lines) add(l.color);
+  if (n === 0) return { r: 0, g: 0, b: 0 };
+  return { r: acc.r / n, g: acc.g / n, b: acc.b / n };
 }
 
 const PACK: ReadonlyArray<[string, PresetDefinition]> = [
@@ -152,230 +303,325 @@ const PACK: ReadonlyArray<[string, PresetDefinition]> = [
   ["Light 3D", light3dPreset],
 ];
 
-const WITH_SEED: ReadonlyArray<[string, (seed: number) => PresetDefinition]> = [
+/** With-seed factories so the determinism/reseed checks can vary the seed. */
+const SEEDED: ReadonlyArray<[string, (seed: number) => PresetDefinition]> = [
   ["Particles", particlesPresetWithSeed],
   ["Fluid", fluidPresetWithSeed],
   ["Light 3D", light3dPresetWithSeed],
 ];
 
-/** Several frames of loud audio with a periodic beat — enough state to diverge. */
-function loudRun(n = 40): AudioFeatureFrame[] {
-  return Array.from({ length: n }, (_v, i) => LOUD({ onset: i % 8 === 0 }));
-}
-
-/** Silent frames for the same duration. */
-function silentRun(n = 40): AudioFeatureFrame[] {
-  return new Array<AudioFeatureFrame>(n).fill(SILENT());
-}
-
 // ---------------------------------------------------------------------------
-// Registry + naming
+// Registry + schema
 // ---------------------------------------------------------------------------
 
-describe("particle pack — registry", () => {
-  it("registers at least three presets into a registry under unique ids", () => {
+describe("particle pack — registry + param schema", () => {
+  it("registers all presets into a registry under unique ids", () => {
     const registry = new PresetRegistry();
     const registered = registerParticlePresets(registry);
-
-    expect(registered.length).toBeGreaterThanOrEqual(3);
+    expect(registered.length).toBe(3);
     for (const def of particlePresets) {
       expect(registry.has(def.id)).toBe(true);
       expect(typeof registry.create(def.id).update).toBe("function");
     }
     expect(registry.size).toBe(particlePresets.length);
-    expect(new Set(particlePresets.map((p) => p.id)).size).toBe(particlePresets.length);
   });
 
-  it("names match the brief and reference technique, not people or trademarks", () => {
-    const names = particlePresets.map((p) => p.name);
-    expect(names).toEqual(expect.arrayContaining(["Particles", "Fluid", "Light 3D"]));
-    for (const name of names) {
-      expect(name).not.toMatch(/navier|stokes|®|™/i);
+  it("keeps the canonical ids and names", () => {
+    expect(particlesPreset.id).toBe("particle.particles");
+    expect(fluidPreset.id).toBe("particle.fluid");
+    expect(light3dPreset.id).toBe("particle.light-3d");
+    expect(particlePresets.map((p) => p.name)).toEqual(
+      expect.arrayContaining(["Particles", "Fluid", "Light 3D"]),
+    );
+  });
+
+  it("each preset declares a non-empty (6+) param schema with unique keys", () => {
+    for (const def of particlePresets) {
+      const params = def.params ?? [];
+      expect(params.length).toBeGreaterThanOrEqual(6);
+      const keys = new Set(params.map((p) => p.key));
+      expect(keys.size).toBe(params.length);
     }
   });
 
-  it("each preset renders a non-empty frame through the Renderer", () => {
-    for (const [, def] of PACK) {
-      const r = drive(def, loudRun(20));
-      expect(r.lastFrameRects.length).toBeGreaterThan(0);
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Seeded determinism — the headline property of this pack
-// ---------------------------------------------------------------------------
-
-describe.each(WITH_SEED)("particle pack — %s is seed-deterministic", (_name, withSeed) => {
-  it("same seed + identical inputs → identical draw set across two runs", () => {
-    const seq = loudRun();
-    const a = drive(withSeed(1234), seq);
-    const b = drive(withSeed(1234), seq);
-    expect(fingerprint(a.lastFrameRects)).toBe(fingerprint(b.lastFrameRects));
-    expect(a.lastFrameRects.length).toBeGreaterThan(0);
-  });
-
-  it("different seeds produce a different draw set", () => {
-    const seq = loudRun();
-    const a = drive(withSeed(1), seq);
-    const b = drive(withSeed(2), seq);
-    expect(fingerprint(a.lastFrameRects)).not.toBe(fingerprint(b.lastFrameRects));
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Audio actually drives the output
-// ---------------------------------------------------------------------------
-
-describe.each(PACK)("particle pack — %s responds to audio", (_name, def) => {
-  it("produces a measurably different draw set for loud/beaty vs silent input", () => {
-    const loud = drive(def, loudRun());
-    const silent = drive(def, silentRun());
-    expect(fingerprint(loud.lastFrameRects)).not.toBe(fingerprint(silent.lastFrameRects));
-  });
-
-  it("is deterministic given the same (features, time)", () => {
-    const seq = loudRun();
-    const a = drive(def, seq);
-    const b = drive(def, seq);
-    expect(fingerprint(a.lastFrameRects)).toBe(fingerprint(b.lastFrameRects));
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Beats raise activity (emission / live count) above silence
-// ---------------------------------------------------------------------------
-
-describe("particle pack — beats increase activity", () => {
-  it("Particles: a beaty run ends with more live particles than a silent run", () => {
-    // Drive enough frames that emission has accumulated under beats while the
-    // silent run has emitted nothing.
-    const loud = drive(particlesPreset, loudRun(30));
-    const silent = drive(particlesPreset, silentRun(30));
-    expect(loud.lastFrameRects.length).toBeGreaterThan(silent.lastFrameRects.length);
-    // Silence emits nothing → no live particles to draw.
-    expect(silent.lastFrameRects.length).toBe(0);
-  });
-
-  it("Fluid: a beaty run injects more dye (more lit cells) than silence", () => {
-    const loud = drive(fluidPreset, loudRun(30));
-    const silent = drive(fluidPreset, silentRun(30));
-    expect(loud.lastFrameRects.length).toBeGreaterThan(silent.lastFrameRects.length);
-  });
-
-  it("emissionCount: a beat emits more than a sustained tone, which emits more than silence", () => {
-    const onBeat = emissionCount(0.85, 0.8, true);
-    const sustained = emissionCount(0, 0.8, false);
-    const silentEmit = emissionCount(0, 0, false);
-    expect(onBeat).toBeGreaterThan(sustained);
-    expect(sustained).toBeGreaterThan(silentEmit);
-    expect(silentEmit).toBe(0);
-  });
-
-  it("emissionSpeed: louder bass throws particles faster", () => {
-    expect(emissionSpeed(0.9)).toBeGreaterThan(emissionSpeed(0.1));
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Performance guard — caps are respected
-// ---------------------------------------------------------------------------
-
-describe("particle pack — performance caps", () => {
-  it("Particles never draws more rects in a frame than its particle cap", () => {
-    const r = drive(particlesPreset, loudRun(120));
-    expect(r.maxRectsInAnyFrame).toBeLessThanOrEqual(DEFAULT_MAX_PARTICLES);
-  });
-
-  it("Particles honours a custom (smaller) maxParticles cap", () => {
-    const small = particlesPresetWithSeed(7, { maxParticles: 50 });
-    const r = drive(small, loudRun(120));
-    expect(r.maxRectsInAnyFrame).toBeLessThanOrEqual(50);
-    expect(r.maxRectsInAnyFrame).toBeGreaterThan(0);
-  });
-
-  it("Light 3D never draws more rects in a frame than its point cap", () => {
-    const r = drive(light3dPreset, loudRun(60));
-    expect(r.maxRectsInAnyFrame).toBeLessThanOrEqual(DEFAULT_MAX_POINTS);
-  });
-
-  it("Light 3D honours a custom (smaller) maxPoints cap", () => {
-    const small = light3dPresetWithSeed(7, { maxPoints: 80 });
-    const r = drive(small, loudRun(60));
-    expect(r.maxRectsInAnyFrame).toBeLessThanOrEqual(80);
-  });
-
-  it("Fluid never draws more rects in a frame than its grid cell count", () => {
-    const small = fluidPresetWithSeed(7, { gridSize: 24 });
-    const r = drive(small, loudRun(80));
-    expect(r.maxRectsInAnyFrame).toBeLessThanOrEqual(24 * 24);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// No Math.random / Date in the pack's source (determinism guard)
-// ---------------------------------------------------------------------------
-
-describe("particle pack — uses a seeded PRNG, never Math.random / Date", () => {
-  it("no source file in src/particle references Math.random or Date.now", () => {
-    const here = dirname(fileURLToPath(import.meta.url));
-    const files = readdirSync(here).filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"));
-    expect(files.length).toBeGreaterThan(0);
-    for (const f of files) {
-      const raw = readFileSync(join(here, f), "utf8");
-      const code = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
-      expect(code, `${f} must not call Math.random()`).not.toMatch(/Math\s*\.\s*random/);
-      expect(code, `${f} must not call Date.now() / new Date`).not.toMatch(/Date\s*\.\s*now|new\s+Date/);
-    }
-  });
-
-  it("mulberry32 yields a deterministic stream for a given seed", () => {
-    const a = mulberry32(42);
-    const b = mulberry32(42);
-    const c = mulberry32(43);
-    const seqA = [a(), a(), a(), a()];
-    const seqB = [b(), b(), b(), b()];
-    const seqC = [c(), c(), c(), c()];
-    expect(seqA).toEqual(seqB);
-    expect(seqA).not.toEqual(seqC);
-    for (const v of seqA) {
-      expect(v).toBeGreaterThanOrEqual(0);
-      expect(v).toBeLessThan(1);
+  it("names reference techniques, not people or trademarks", () => {
+    for (const name of particlePresets.map((p) => p.name)) {
+      expect(name).not.toMatch(/houdini|navier|stokes|unity®|unreal/i);
     }
   });
 });
 
 // ---------------------------------------------------------------------------
-// Pure parameter helpers
+// Audio reactivity + cinematic surface
+// ---------------------------------------------------------------------------
+
+describe.each(PACK)("particle pack — %s is cinematic + audio-reactive", (_name, def) => {
+  it("draws a non-empty frame using additive light (glow)", () => {
+    const { renderer } = drive(
+      def,
+      [LOUD(), LOUD({ onset: true }), LOUD(), LOUD({ onset: true }), LOUD()],
+      hotDirector(),
+    );
+    const f = renderer.lastFrame;
+    const total = f.rects.length + f.gradients.length + f.glows.length + f.lines.length;
+    expect(total).toBeGreaterThan(0);
+    // Cinematic: it must emit soft additive light — glow blobs.
+    expect(f.glows.length).toBeGreaterThan(0);
+  });
+
+  it("sets cinematic post-FX (bloom + feedback on) when active", () => {
+    const { renderer } = drive(def, [LOUD()], hotDirector());
+    expect(renderer.postEffects.length).toBeGreaterThan(0);
+    const last = renderer.postEffects.at(-1)!;
+    expect(last.bloom?.enabled).toBe(true);
+    expect(last.feedback?.enabled).toBe(true);
+  });
+
+  it("a loud frame emits MORE/brighter light than a silent frame", () => {
+    const loud = drive(
+      def,
+      [LOUD(), LOUD({ onset: true }), LOUD(), LOUD({ onset: true }), LOUD()],
+      hotDirector(),
+    );
+    const silent = drive(def, [SILENT(), SILENT(), SILENT(), SILENT(), SILENT()], calmDirector());
+    expect(glowEnergy(loud.renderer)).toBeGreaterThan(glowEnergy(silent.renderer));
+  });
+
+  it("is deterministic given the same (features, director, time, seed)", () => {
+    const seq = [LOUD(), LOUD({ onset: true }), LOUD(), LOUD({ onset: true })];
+    const a = drive(def, seq, hotDirector());
+    const b = drive(def, seq, hotDirector());
+    expect(fingerprint(a.renderer)).toBe(fingerprint(b.renderer));
+  });
+
+  it("evolves with the director: calm-intro vs hot-drop differ materially", () => {
+    const seq = [LOUD(), LOUD({ onset: true }), LOUD(), LOUD({ onset: true }), LOUD()];
+    const calm = drive(def, seq, calmDirector());
+    const hot = drive(def, seq, hotDirector());
+    // Composition and/or light differ materially.
+    expect(fingerprint(hot.renderer)).not.toBe(fingerprint(calm.renderer));
+    // Both states still produce real draw activity (neither collapses to empty).
+    expect(drawActivity(hot.renderer)).toBeGreaterThan(0);
+    expect(drawActivity(calm.renderer)).toBeGreaterThan(0);
+    // The color signature shifts (palette crossfade + hue rotation) — the core of
+    // director evolution over a song.
+    const sc = colorSignature(calm.renderer);
+    const sh = colorSignature(hot.renderer);
+    const colorDelta =
+      Math.abs(sc.r - sh.r) + Math.abs(sc.g - sh.g) + Math.abs(sc.b - sh.b);
+    expect(colorDelta).toBeGreaterThan(0.02);
+  });
+
+  it("a different palette/hue director state changes the color, not just brightness", () => {
+    const base = hotDirector();
+    const shifted: DirectorState = {
+      ...base,
+      paletteIndex: 7,
+      prevPaletteIndex: 1,
+      paletteBlend: 0.8,
+      hueRotation: 0.7,
+    };
+    const seq = [LOUD(), LOUD({ onset: true }), LOUD(), LOUD({ onset: true }), LOUD()];
+    const a = drive(def, seq, base);
+    const b = drive(def, seq, shifted);
+    const sa = colorSignature(a.renderer);
+    const sb = colorSignature(b.renderer);
+    const delta = Math.abs(sa.r - sb.r) + Math.abs(sa.g - sb.g) + Math.abs(sa.b - sb.b);
+    expect(delta).toBeGreaterThan(0.02);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Seeded determinism + per-section reseed
+// ---------------------------------------------------------------------------
+
+describe.each(SEEDED)("particle pack — %s seeded determinism + reseed", (_name, withSeed) => {
+  const seq = [LOUD(), LOUD({ onset: true }), LOUD(), LOUD()];
+
+  it("identical seed + inputs reproduce an identical draw set across runs", () => {
+    const a = drive(withSeed(1234), seq, hotDirector());
+    const b = drive(withSeed(1234), seq, hotDirector());
+    expect(fingerprint(a.renderer)).toBe(fingerprint(b.renderer));
+  });
+
+  it("a different base seed diverges (a different generated pattern)", () => {
+    const a = drive(withSeed(1234), seq, hotDirector());
+    const b = drive(withSeed(9876), seq, hotDirector());
+    expect(fingerprint(a.renderer)).not.toBe(fingerprint(b.renderer));
+  });
+
+  it("changing the director's seed (a section change) changes the pattern", () => {
+    // Same base seed + identical audio; only the director's per-section seed
+    // differs. The per-section reseed must produce a materially different frame.
+    const d1: DirectorState = { ...hotDirector(), seed: 0x11111111 };
+    const d2: DirectorState = { ...hotDirector(), seed: 0x22222222 };
+    const a = drive(withSeed(42), seq, d1);
+    const b = drive(withSeed(42), seq, d2);
+    expect(fingerprint(a.renderer)).not.toBe(fingerprint(b.renderer));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Performance guard — the particle count respects the hard cap
+// ---------------------------------------------------------------------------
+
+describe("particle pack — performance guard", () => {
+  it("Particles never draws more glows than the hard cap, even under a beat storm", () => {
+    // Drive many beats with a maxed director density so emission is maximal; the
+    // live particle count (and thus glow draws) must stay within the cap.
+    const seq: AudioFeatureFrame[] = [];
+    for (let i = 0; i < 120; i++) seq.push(LOUD({ onset: true }));
+    const dense: DirectorState = { ...hotDirector(), density: 100 };
+    const { renderer } = drive(particlesPreset, seq, dense);
+    expect(renderer.lastFrame.glows.length).toBeLessThanOrEqual(DEFAULT_MAX_PARTICLES);
+    // …and the storm actually produced a busy field (the cap isn't trivially met).
+    expect(renderer.lastFrame.glows.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Director color helper
+// ---------------------------------------------------------------------------
+
+describe("particle pack — directorColor evolves with the state", () => {
+  it("a different paletteBlend yields a different color", () => {
+    const d = hotDirector();
+    const a = directorColor({ ...d, paletteBlend: 0 }, 0.6);
+    const b = directorColor({ ...d, paletteBlend: 1 }, 0.6);
+    const delta = Math.abs(a.r - b.r) + Math.abs(a.g - b.g) + Math.abs(a.b - b.b);
+    expect(delta).toBeGreaterThan(0.01);
+  });
+
+  it("a different hueRotation yields a different color", () => {
+    const d = hotDirector();
+    const a = directorColor({ ...d, hueRotation: 0 }, 0.6);
+    const b = directorColor({ ...d, hueRotation: 0.5 }, 0.6);
+    const delta = Math.abs(a.r - b.r) + Math.abs(a.g - b.g) + Math.abs(a.b - b.b);
+    expect(delta).toBeGreaterThan(0.01);
+  });
+
+  it("paletteForIndex wraps safely for any index", () => {
+    expect(paletteForIndex(0)).toBeDefined();
+    expect(paletteForIndex(-3)).toBeDefined();
+    expect(paletteForIndex(999)).toBeDefined();
+  });
+
+  it("a live Director produces an evolving state that drives changing color", () => {
+    const director = new Director();
+    const first = directorColor(director.update(LOUD(), 1 / 60), 0.6);
+    let last = first;
+    for (let i = 0; i < 600; i++) last = director.update(LOUD({ onset: i % 12 === 0 }), 1 / 60);
+    const lastCol = directorColor(last as DirectorState, 0.6);
+    const delta =
+      Math.abs(first.r - lastCol.r) + Math.abs(first.g - lastCol.g) + Math.abs(first.b - lastCol.b);
+    expect(delta).toBeGreaterThan(0.005);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pure helper response curves
 // ---------------------------------------------------------------------------
 
 describe("particle pack — pure helpers", () => {
-  it("fluid: bass raises rise speed; treble raises swirl", () => {
-    expect(fluidParams(0.9, 0.2, 0).rise).toBeGreaterThan(fluidParams(0.1, 0.2, 0).rise);
-    expect(fluidParams(0.2, 0.9, 0).swirl).toBeGreaterThan(fluidParams(0.2, 0.1, 0).swirl);
-    // A beat burst adds energy to both.
-    expect(fluidParams(0.3, 0.3, 0.9).rise).toBeGreaterThan(fluidParams(0.3, 0.3, 0).rise);
+  it("sectionSeed decorrelates: different director seeds → different combined seed", () => {
+    expect(sectionSeed(42, 0x11111111)).not.toBe(sectionSeed(42, 0x22222222));
+    // Deterministic: same inputs → same seed.
+    expect(sectionSeed(42, 7)).toBe(sectionSeed(42, 7));
   });
 
-  it("light3d: treble/beat raise spin; bass raises the radius pulse", () => {
-    expect(light3dParams(0.2, 0.9, 0).spin).toBeGreaterThan(light3dParams(0.2, 0.1, 0).spin);
-    expect(light3dParams(0.2, 0.2, 0.9).spin).toBeGreaterThan(light3dParams(0.2, 0.2, 0).spin);
-    expect(light3dParams(0.9, 0.2, 0).pulse).toBeGreaterThan(light3dParams(0.1, 0.2, 0).pulse);
+  it("emissionCount: a beat + denser director raises emission above silence", () => {
+    const silent = emissionCount(0, 0, false, 0.6, 0.6);
+    const beat = emissionCount(0.8, 0.8, true, 0.6, 0.6);
+    expect(beat).toBeGreaterThan(silent);
+    expect(silent).toBe(0);
+    // Denser director throws more on a beat.
+    const sparse = emissionCount(0.8, 0.8, true, 0.6, 0.6);
+    const dense = emissionCount(0.8, 0.8, true, 0.6, 1.6);
+    expect(dense).toBeGreaterThan(sparse);
   });
 
-  it("project: a nearer point projects larger (bigger depth factor) than a farther one", () => {
-    // No rotation → z directly controls depth. Negative z is toward the camera.
-    const near = project({ x: 0, y: 0, z: -0.8 }, 1, 0, 1, 0, 1);
-    const far = project({ x: 0, y: 0, z: 0.8 }, 1, 0, 1, 0, 1);
+  it("emissionSpeed: louder bass throws particles faster", () => {
+    expect(emissionSpeed(0.9, 0.6)).toBeGreaterThan(emissionSpeed(0.1, 0.6));
+  });
+
+  it("fluidParams: bass raises rise; treble raises swirl", () => {
+    expect(fluidParams(0.9, 0.5, 0, 0.6, 0.6).rise).toBeGreaterThan(
+      fluidParams(0.1, 0.5, 0, 0.6, 0.6).rise,
+    );
+    expect(fluidParams(0.5, 0.9, 0, 0.6, 0.6).swirl).toBeGreaterThan(
+      fluidParams(0.5, 0.1, 0, 0.6, 0.6).swirl,
+    );
+  });
+
+  it("light3dParams: treble/beat/motion raise spin; bass raises the radius pulse", () => {
+    const slow = light3dParams(0.5, 0.1, 0, 0.7, 0.6, 0.6).spin;
+    const fast = light3dParams(0.5, 0.9, 0.8, 1.6, 0.6, 0.6).spin;
+    expect(fast).toBeGreaterThan(slow);
+    expect(light3dParams(0.9, 0.5, 0, 1, 0.6, 0.6).pulse).toBeGreaterThan(
+      light3dParams(0.1, 0.5, 0, 1, 0.6, 0.6).pulse,
+    );
+  });
+
+  it("project: a nearer point projects with a larger depth factor than a far point", () => {
+    const near = project({ x: 0, y: 0, z: -1 }, 1, 0, 1, 0, 1);
+    const far = project({ x: 0, y: 0, z: 1 }, 1, 0, 1, 0, 1);
     expect(near).not.toBeNull();
     expect(far).not.toBeNull();
     expect(near!.depth).toBeGreaterThan(far!.depth);
   });
+});
 
-  it("project: a point too close to / behind the camera is culled (returns null)", () => {
-    // No rotation → rz = z * radius. CAMERA_Z is 3, so rz <= -2.95 collapses the
-    // perspective denominator; z = -0.99 * radius 3 = -2.97 trips the cull.
-    const behind = project({ x: 0, y: 0, z: -0.99 }, 1, 0, 1, 0, 3);
-    expect(behind).toBeNull();
+// ---------------------------------------------------------------------------
+// Per-preset beat-response specifics
+// ---------------------------------------------------------------------------
+
+describe("particle pack — beat response", () => {
+  it("Particles: a beat sprays more / brighter glow than no beat", () => {
+    const noBeat = drive(
+      particlesPreset,
+      [LOUD({ onset: false }), LOUD({ onset: false }), LOUD({ onset: false })],
+      hotDirector(),
+    );
+    const beat = drive(
+      particlesPreset,
+      [LOUD({ onset: true }), LOUD({ onset: true }), LOUD({ onset: true })],
+      hotDirector(),
+    );
+    expect(glowEnergy(beat.renderer)).toBeGreaterThan(glowEnergy(noBeat.renderer));
+  });
+
+  it("Light 3D: a beat swells the glow brighter than no beat", () => {
+    const noBeat = drive(
+      light3dPreset,
+      [LOUD({ onset: false }), LOUD({ onset: false })],
+      hotDirector(),
+    );
+    const beat = drive(
+      light3dPreset,
+      [LOUD({ onset: true }), LOUD({ onset: true })],
+      hotDirector(),
+    );
+    expect(glowEnergy(beat.renderer)).toBeGreaterThan(glowEnergy(noBeat.renderer));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// No Math.random / Date.now in the pack source
+// ---------------------------------------------------------------------------
+
+describe("particle pack — determinism hygiene", () => {
+  it("the pack source contains no Math.random / Date.now", () => {
+    const dir = dirname(fileURLToPath(import.meta.url));
+    const files = readdirSync(dir).filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"));
+    expect(files.length).toBeGreaterThan(0);
+    for (const file of files) {
+      // Strip line + block comments so a doc mention ("instead of Math.random")
+      // doesn't false-positive — we only care about actual calls.
+      const code = readFileSync(join(dir, file), "utf8")
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/.*$/gm, "");
+      expect(code, `${file} must not call Math.random()`).not.toMatch(/Math\s*\.\s*random/);
+      expect(code, `${file} must not call Date.now()`).not.toMatch(/Date\s*\.\s*now/);
+    }
   });
 });

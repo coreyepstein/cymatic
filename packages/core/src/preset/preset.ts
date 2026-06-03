@@ -16,6 +16,9 @@
  */
 
 import type { AudioFeatureFrame } from "../audio/features.js";
+import type { ParamSchema, ParamValue } from "../params/schema.js";
+import type { ParamSet } from "../params/param-set.js";
+import type { DirectorState } from "../director/director.js";
 import type { Renderer } from "../render/renderer.js";
 
 /**
@@ -32,6 +35,30 @@ export interface PresetContext {
   readonly height: number;
   /** Initial device-pixel-ratio. */
   readonly dpr: number;
+}
+
+/**
+ * Per-frame, host-supplied context threaded into {@link Preset.update} on top of
+ * the audio frame (V2-10). Backward-compatible and fully optional: a host that
+ * does not run an auto-director (or a preset that ignores it) keeps working
+ * exactly as before. Cinematic presets read {@link PresetFrameContext.director}
+ * to evolve their look over a whole track.
+ */
+export interface PresetFrameContext {
+  /**
+   * The current auto-director macro state, if the host runs a
+   * {@link "../director/director.js".Director}. When present, presets sample the
+   * crossfading palette / hue rotation / intensity / motion / density to build
+   * and drop with the song. When absent, presets fall back to a resting state.
+   */
+  readonly director?: DirectorState;
+  /**
+   * Optionally pre-resolved parameter values, keyed by param key. Most presets
+   * own their own {@link "../params/param-set.js".ParamSet} and resolve
+   * internally; this field lets a host that wants centralized control inject
+   * already-resolved values instead. Purely additive.
+   */
+  readonly params?: Readonly<Record<string, ParamValue>>;
 }
 
 /**
@@ -52,11 +79,32 @@ export interface Preset {
    * Produce one frame. `features` is the current audio snapshot, `time` the
    * elapsed seconds, `dt` the seconds since the previous frame. The preset
    * issues its draws through the {@link Renderer} captured at {@link Preset.init}.
+   *
+   * The optional `frameContext` (V2-10) threads the auto-director macro state
+   * (and optionally pre-resolved params) so cinematic presets can evolve over a
+   * whole track. It is fully optional and backward-compatible: presets that
+   * ignore it — and hosts that omit it — behave exactly as before.
    */
-  update(features: AudioFeatureFrame, time: number, dt: number): void;
+  update(
+    features: AudioFeatureFrame,
+    time: number,
+    dt: number,
+    frameContext?: PresetFrameContext,
+  ): void;
 
   /** Release preset-held resources. Idempotent. */
   dispose(): void;
+
+  /**
+   * The preset's per-instance {@link ParamSet}, when it declared a `params`
+   * schema and resolves its own parameters (V2-14). Optional and additive: a
+   * preset without parameters (or one that takes pre-resolved values from the
+   * host) leaves this absent/`null`. A host (the gallery) reads it to
+   * auto-render controls, set manual overrides, randomize, or re-bind a param
+   * to its default — driving the live look without reaching into preset code.
+   * Compositions built with `composePreset` populate it automatically.
+   */
+  readonly paramSet?: ParamSet | null;
 }
 
 /** Static metadata describing a preset, independent of any instance. */
@@ -69,6 +117,14 @@ export interface PresetMeta {
   readonly description?: string;
   /** Optional tags for discovery / filtering. */
   readonly tags?: readonly string[];
+  /**
+   * Optional declarative parameter schema (V2-08). When present, hosts can
+   * introspect a preset's tunable knobs without instantiating it (to
+   * auto-render controls); the preset reads resolved values each frame via a
+   * {@link "../params/index.js".ParamSet}. Presets that omit `params` keep
+   * working exactly as before — the field is purely additive.
+   */
+  readonly params?: readonly ParamSchema[];
 }
 
 /**
@@ -105,6 +161,7 @@ export function definePreset(input: DefinePresetInput): PresetDefinition {
     name: input.name,
     description: input.description,
     tags: input.tags,
+    params: input.params,
     create: input.create,
   });
 }

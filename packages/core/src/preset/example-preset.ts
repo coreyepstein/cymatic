@@ -47,9 +47,16 @@ function makeExampleLayer(): Layer {
     init(): void {
       bass = smoothBand("bass", 0.6);
     },
-    draw({ renderer, features }: LayerFrame): void {
+    draw({ renderer, features, director }: LayerFrame): void {
       const smoother = bass ?? smoothBand("bass", 0.6);
-      const brightness = exampleBackgroundBrightness(smoother.push(features), features.onset);
+      // The director's intensity gently lifts the floor brightness so the look
+      // builds over a track even before a beat — a minimal demonstration of the
+      // V2-10 director threading on the reference preset.
+      const brightness = Math.min(
+        1,
+        exampleBackgroundBrightness(smoother.push(features), features.onset) +
+          director.intensity * 0.1,
+      );
       // Tint the background toward the palette's low end so it stays in family.
       const tint = sample(palettes.sunset, 0);
       renderer.beginFrame({

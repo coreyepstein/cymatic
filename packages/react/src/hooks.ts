@@ -16,15 +16,20 @@
 
 import {
   AudioAnalyser,
+  Director,
   RealtimeClock,
   connectElementSource,
   connectMicrophoneSource,
   createRenderer,
   playBufferSource,
   toRgba,
+  ZERO_MOOD,
+  restingDirectorState,
   type AnalyserOptions,
   type AudioFeatureFrame,
   type CreateRendererOptions,
+  type DirectorState,
+  type ParamSet,
   type Preset,
   type RenderCanvasLike,
   type Renderer,
@@ -82,6 +87,29 @@ export interface UseVisualizerOptions {
    */
   onFeatures?: (frame: AudioFeatureFrame) => void;
 
+  /**
+   * Invoked once per rendered frame with the current {@link DirectorState}
+   * driving the preset — the live macro state when the auto-director is enabled,
+   * or the resting state when it is off. Read through a ref so a changing
+   * identity does not restart the engine. Lets a host render a director HUD.
+   */
+  onDirectorState?: (state: DirectorState) => void;
+
+  /**
+   * Enable the auto-director (V2-14). When `true` (default) a live
+   * {@link "@cymatic/core".Director} evolves the look over the track; when
+   * `false` the preset receives a deterministic resting state instead, so it
+   * falls back to audio / manual params. Toggling does NOT tear down the engine.
+   */
+  directorEnabled?: boolean;
+
+  /**
+   * Seed for the auto-director's deterministic drift / palette generators
+   * (V2-14). Changing it reseeds the director live (no engine teardown) so the
+   * generated look changes. Ignored when {@link directorEnabled} is `false`.
+   */
+  directorSeed?: number;
+
   /** When true, the render loop is paused (clock stopped). Default `false`. */
   paused?: boolean;
 }
@@ -96,6 +124,12 @@ export interface VisualizerHandle {
   error: Error | null;
   /** The most recent feature frame, or `null` before the first frame. */
   features: AudioFeatureFrame | null;
+  /**
+   * The active preset's {@link ParamSet} once the preset is mounted, or `null`
+   * when the preset declares no params (V2-14). A host drives live parameter
+   * controls through it (`getSchema` / `setManual` / `bind` / `getResolved`).
+   */
+  paramSet: ParamSet | null;
 }
 
 /** An empty, all-zero feature frame used when no audio input is wired. */
@@ -107,6 +141,16 @@ function silentFrame(time: number): AudioFeatureFrame {
     treble: 0,
     rms: 0,
     onset: false,
+    spectralCentroid: 0,
+    spectralRolloff: 0,
+    spectralFlux: 0,
+    loudnessShort: 0,
+    loudnessLong: 0,
+    dynamics: 0,
+    tempo: 0,
+    beatPhase: 0,
+    onsetDensity: 0,
+    mood: ZERO_MOOD,
     time,
   };
 }
@@ -147,6 +191,9 @@ export function useVisualizer(options: UseVisualizerOptions): VisualizerHandle {
     analyser: analyserOptions,
     renderer: rendererOptions,
     onFeatures,
+    onDirectorState,
+    directorEnabled = true,
+    directorSeed,
     paused = false,
   } = options;
 
@@ -154,13 +201,24 @@ export function useVisualizer(options: UseVisualizerOptions): VisualizerHandle {
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [features, setFeatures] = useState<AudioFeatureFrame | null>(null);
+  const [paramSet, setParamSet] = useState<ParamSet | null>(null);
 
   // Read mutable callbacks/preset through refs so their identity changing does
   // not tear down and re-create the GPU/audio graph every render.
   const onFeaturesRef = useRef(onFeatures);
   onFeaturesRef.current = onFeatures;
+  const onDirectorStateRef = useRef(onDirectorState);
+  onDirectorStateRef.current = onDirectorState;
   const presetRef = useRef(preset);
   presetRef.current = preset;
+
+  // Director controls read through refs so toggling / reseeding does not rebuild
+  // the GPU + audio graph; the frame loop reads the latest value each tick.
+  const directorEnabledRef = useRef(directorEnabled);
+  directorEnabledRef.current = directorEnabled;
+  // The live Director instance for the current mount, so a seed change can reset
+  // it without a teardown. Set inside the effect (SSR-safe).
+  const directorRef = useRef<Director | null>(null);
 
   // The clock lives across renders so `paused` can start/stop it without a full
   // teardown. It is created lazily inside the effect (never at module/render
@@ -178,6 +236,16 @@ export function useVisualizer(options: UseVisualizerOptions): VisualizerHandle {
     let createdAudioEl: HTMLAudioElement | null = null;
     const clock = new RealtimeClock();
     clockRef.current = clock;
+
+    // The auto-director evolves the look over a whole track (intensity, motion,
+    // density, crossfading palette, hue rotation). It lives across frames for
+    // this mount, advances deterministically on the frame `dt`, and its state is
+    // threaded into every `preset.update(...)`. Cinematic presets read it; older
+    // presets that ignore the 4th arg are unaffected.
+    const director = new Director(
+      typeof directorSeed === "number" ? { seed: directorSeed } : {},
+    );
+    directorRef.current = director;
 
     let lastTime = 0;
 
@@ -243,7 +311,18 @@ export function useVisualizer(options: UseVisualizerOptions): VisualizerHandle {
 
       onFeaturesRef.current?.(featureFrame);
       setFeatures(featureFrame);
-      presetRef.current.update(featureFrame, time, dt);
+      // Advance the director on this frame's audio + dt when enabled, then
+      // thread its macro state into the preset so cinematic presets evolve over
+      // the track. When the auto-director is off, hand the preset a
+      // deterministic resting state so it falls back to audio / manual params.
+      // The director is still advanced (cheap, deterministic) so re-enabling
+      // resumes from where the song is rather than snapping.
+      const live = director.update(featureFrame, dt);
+      const directorState: DirectorState = directorEnabledRef.current
+        ? live
+        : restingDirectorState(live.seed);
+      onDirectorStateRef.current?.(directorState);
+      presetRef.current.update(featureFrame, time, dt, { director: directorState });
     };
 
     // Create a renderer and initialize it, transparently falling back to the
@@ -289,6 +368,11 @@ export function useVisualizer(options: UseVisualizerOptions): VisualizerHandle {
         });
         if (disposed) return;
 
+        // Surface the preset's ParamSet (if any) so a host can drive live
+        // parameter controls. Read after init so a preset that builds it lazily
+        // is captured. Null for presets that declare no params.
+        setParamSet(presetRef.current.paramSet ?? null);
+
         wired = await wireInput();
         if (disposed) {
           // The input may have been wired after we were torn down.
@@ -319,6 +403,7 @@ export function useVisualizer(options: UseVisualizerOptions): VisualizerHandle {
       disposed = true;
       clock.stop();
       clockRef.current = null;
+      directorRef.current = null;
       resizeObserver?.disconnect();
       void wired?.dispose();
       renderer?.dispose();
@@ -327,6 +412,7 @@ export function useVisualizer(options: UseVisualizerOptions): VisualizerHandle {
         createdAudioEl.removeAttribute("src");
         createdAudioEl.load();
       }
+      setParamSet(null);
       setReady(false);
     };
     // The engine is rebuilt only when the *kind* of input or core options
@@ -353,7 +439,15 @@ export function useVisualizer(options: UseVisualizerOptions): VisualizerHandle {
     }
   }, [paused, ready]);
 
-  return { canvasRef, ready, error, features };
+  // Reseed the live director when `directorSeed` changes — no engine teardown,
+  // so the generated look re-rolls while audio + GPU keep running. `ready` is a
+  // dep so a seed set before the director exists is applied once it is up.
+  useEffect(() => {
+    if (typeof directorSeed !== "number") return;
+    directorRef.current?.reset(directorSeed);
+  }, [directorSeed, ready]);
+
+  return { canvasRef, ready, error, features, paramSet };
 }
 
 /**
