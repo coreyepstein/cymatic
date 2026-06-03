@@ -16,7 +16,8 @@
  */
 
 import type { AudioFeatureFrame } from "../audio/features.js";
-import type { ParamSchema } from "../params/schema.js";
+import type { ParamSchema, ParamValue } from "../params/schema.js";
+import type { DirectorState } from "../director/director.js";
 import type { Renderer } from "../render/renderer.js";
 
 /**
@@ -33,6 +34,30 @@ export interface PresetContext {
   readonly height: number;
   /** Initial device-pixel-ratio. */
   readonly dpr: number;
+}
+
+/**
+ * Per-frame, host-supplied context threaded into {@link Preset.update} on top of
+ * the audio frame (V2-10). Backward-compatible and fully optional: a host that
+ * does not run an auto-director (or a preset that ignores it) keeps working
+ * exactly as before. Cinematic presets read {@link PresetFrameContext.director}
+ * to evolve their look over a whole track.
+ */
+export interface PresetFrameContext {
+  /**
+   * The current auto-director macro state, if the host runs a
+   * {@link "../director/director.js".Director}. When present, presets sample the
+   * crossfading palette / hue rotation / intensity / motion / density to build
+   * and drop with the song. When absent, presets fall back to a resting state.
+   */
+  readonly director?: DirectorState;
+  /**
+   * Optionally pre-resolved parameter values, keyed by param key. Most presets
+   * own their own {@link "../params/param-set.js".ParamSet} and resolve
+   * internally; this field lets a host that wants centralized control inject
+   * already-resolved values instead. Purely additive.
+   */
+  readonly params?: Readonly<Record<string, ParamValue>>;
 }
 
 /**
@@ -53,8 +78,18 @@ export interface Preset {
    * Produce one frame. `features` is the current audio snapshot, `time` the
    * elapsed seconds, `dt` the seconds since the previous frame. The preset
    * issues its draws through the {@link Renderer} captured at {@link Preset.init}.
+   *
+   * The optional `frameContext` (V2-10) threads the auto-director macro state
+   * (and optionally pre-resolved params) so cinematic presets can evolve over a
+   * whole track. It is fully optional and backward-compatible: presets that
+   * ignore it — and hosts that omit it — behave exactly as before.
    */
-  update(features: AudioFeatureFrame, time: number, dt: number): void;
+  update(
+    features: AudioFeatureFrame,
+    time: number,
+    dt: number,
+    frameContext?: PresetFrameContext,
+  ): void;
 
   /** Release preset-held resources. Idempotent. */
   dispose(): void;

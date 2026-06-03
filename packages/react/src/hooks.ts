@@ -16,6 +16,7 @@
 
 import {
   AudioAnalyser,
+  Director,
   RealtimeClock,
   connectElementSource,
   connectMicrophoneSource,
@@ -26,6 +27,7 @@ import {
   type AnalyserOptions,
   type AudioFeatureFrame,
   type CreateRendererOptions,
+  type DirectorState,
   type Preset,
   type RenderCanvasLike,
   type Renderer,
@@ -190,6 +192,13 @@ export function useVisualizer(options: UseVisualizerOptions): VisualizerHandle {
     const clock = new RealtimeClock();
     clockRef.current = clock;
 
+    // The auto-director evolves the look over a whole track (intensity, motion,
+    // density, crossfading palette, hue rotation). It lives across frames for
+    // this mount, advances deterministically on the frame `dt`, and its state is
+    // threaded into every `preset.update(...)`. Cinematic presets read it; older
+    // presets that ignore the 4th arg are unaffected.
+    const director = new Director();
+
     let lastTime = 0;
 
     const applyResize = (): void => {
@@ -254,7 +263,10 @@ export function useVisualizer(options: UseVisualizerOptions): VisualizerHandle {
 
       onFeaturesRef.current?.(featureFrame);
       setFeatures(featureFrame);
-      presetRef.current.update(featureFrame, time, dt);
+      // Advance the director on this frame's audio + dt, then thread its macro
+      // state into the preset so cinematic presets evolve over the track.
+      const directorState: DirectorState = director.update(featureFrame, dt);
+      presetRef.current.update(featureFrame, time, dt, { director: directorState });
     };
 
     // Create a renderer and initialize it, transparently falling back to the

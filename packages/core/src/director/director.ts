@@ -94,6 +94,18 @@ function initialState(seed: number): DirectorState {
   };
 }
 
+/**
+ * A deterministic, neutral {@link DirectorState} for hosts that do NOT run a
+ * live {@link Director} (V2-10). Cinematic presets read `director.*` every
+ * frame; threading this resting state when no director is supplied lets them
+ * stay unconditional (no `?.`/branching) while behaving sensibly — a calm
+ * intro look (low intensity, neutral motion/density, first palette). Pure: the
+ * same `seed` always yields the same snapshot.
+ */
+export function restingDirectorState(seed = DEFAULTS.seed): DirectorState {
+  return initialState(seed);
+}
+
 /** Tuning for the {@link Director}. All fields optional. */
 export interface DirectorOptions {
   /** Initial seed for the deterministic drift generators. Default `0x1a2b3c4d`. */

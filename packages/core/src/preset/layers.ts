@@ -14,12 +14,17 @@
 
 import type { AudioFeatureFrame } from "../audio/features.js";
 import type { Renderer } from "../render/renderer.js";
+import { restingDirectorState, type DirectorState } from "../director/director.js";
+import { createParamSet, type ParamSet } from "../params/param-set.js";
+import type { ParamBindings } from "../params/bindings.js";
+import type { ParamSchema, ParamValue } from "../params/schema.js";
 import {
   definePreset,
   type DefinePresetInput,
   type Preset,
   type PresetContext,
   type PresetDefinition,
+  type PresetFrameContext,
 } from "./preset.js";
 
 /** Per-frame context handed to each layer's {@link Layer.draw}. */
@@ -36,6 +41,26 @@ export interface LayerFrame {
   readonly width: number;
   /** Backing-store height in device pixels. */
   readonly height: number;
+  /**
+   * The auto-director macro state for this frame (V2-10). Always present: when
+   * the host supplies one it is threaded verbatim; otherwise a deterministic
+   * {@link restingDirectorState} stands in so cinematic presets can read
+   * `director.*` unconditionally.
+   */
+  readonly director: DirectorState;
+  /**
+   * Resolved parameter values for this frame, keyed by param key (V2-10). Only
+   * populated when the composition declared a `params` schema; otherwise an
+   * empty map. The composition resolves these from the preset's declared
+   * bindings against the live `(features, director, time, dt)` each frame.
+   */
+  readonly params: Readonly<Record<string, ParamValue>>;
+  /**
+   * The composition's per-instance {@link ParamSet}, when a `params` schema was
+   * declared (else `null`). Lets a layer introspect / re-bind params; most
+   * layers just read {@link LayerFrame.params}.
+   */
+  readonly paramSet: ParamSet | null;
 }
 
 /** Resize info handed to {@link Layer.resize}. */
@@ -135,13 +160,32 @@ export interface ComposeOptions extends Omit<DefinePresetInput, "create"> {
    * Background color factory, evaluated each frame. The composed preset opens
    * the frame with this color before any layer draws, and closes it after. If
    * omitted, layers are responsible for opening/closing the frame themselves.
+   *
+   * Receives the resolved per-frame {@link LayerFrame} so the background can
+   * read audio, the director, and resolved params (e.g. a deep, palette-tinted
+   * void that evolves with the song). The two-arg `(features, time)` shape is
+   * still honoured for back-compat — extra args are simply ignored by older
+   * factories.
    */
-  background?: (features: AudioFeatureFrame, time: number) => {
+  background?: (
+    features: AudioFeatureFrame,
+    time: number,
+    frame?: LayerFrame,
+  ) => {
     r: number;
     g: number;
     b: number;
     a: number;
   };
+  /**
+   * Default parameter bindings (V2-10), keyed by the param keys declared in
+   * {@link DefinePresetInput.params}. Each `create()` builds a fresh per-instance
+   * {@link ParamSet} from `params` + these bindings; the composition resolves it
+   * every frame and exposes the values via {@link LayerFrame.params}. Missing
+   * keys default to a `const` at the schema default. Ignored when no `params`
+   * schema is declared.
+   */
+  bindings?: ParamBindings;
 }
 
 /**
@@ -154,15 +198,25 @@ export interface ComposeOptions extends Omit<DefinePresetInput, "create"> {
  * gets a registry-ready definition with correct lifecycle wiring for free.
  */
 export function composePreset(options: ComposeOptions): PresetDefinition {
-  const { layers, background, ...meta } = options;
+  const { layers, background, bindings, params, ...meta } = options;
+  const paramSchema: readonly ParamSchema[] | undefined = params;
 
   return definePreset({
     ...meta,
+    params: paramSchema,
     create(): Preset {
       const built = typeof layers === "function" ? layers() : layers;
       const stack = new LayerStack([...built]);
       let size: LayerResize = { width: 0, height: 0, dpr: 1 };
       let renderer: Renderer | null = null;
+      // Build a fresh per-instance ParamSet from the declared schema + default
+      // bindings, so each `create()` gets independent smoothing / LFO / random
+      // state. Null when the composition declares no params.
+      const paramSet: ParamSet | null =
+        paramSchema && paramSchema.length > 0
+          ? createParamSet(paramSchema, { bindings })
+          : null;
+      const EMPTY_PARAMS: Readonly<Record<string, ParamValue>> = Object.freeze({});
 
       return {
         async init(ctx: PresetContext): Promise<void> {
@@ -174,10 +228,29 @@ export function composePreset(options: ComposeOptions): PresetDefinition {
           size = { width, height, dpr };
           stack.resize(size);
         },
-        update(features: AudioFeatureFrame, time: number, dt: number): void {
+        update(
+          features: AudioFeatureFrame,
+          time: number,
+          dt: number,
+          frameContext?: PresetFrameContext,
+        ): void {
           if (!renderer) {
             throw new Error("composePreset: update() called before init()");
           }
+          // Director: thread the host's macro state, or a deterministic resting
+          // state so cinematic presets can read `director.*` unconditionally.
+          const director = frameContext?.director ?? restingDirectorState();
+          // Resolve params for this frame. A host-supplied pre-resolved map wins
+          // (centralized control); otherwise resolve from this instance's set.
+          let resolved: Readonly<Record<string, ParamValue>>;
+          if (frameContext?.params) {
+            resolved = frameContext.params;
+          } else if (paramSet) {
+            resolved = paramSet.resolve({ features, director, time, dt });
+          } else {
+            resolved = EMPTY_PARAMS;
+          }
+
           const frame: LayerFrame = {
             renderer,
             features,
@@ -185,9 +258,12 @@ export function composePreset(options: ComposeOptions): PresetDefinition {
             dt,
             width: size.width,
             height: size.height,
+            director,
+            params: resolved,
+            paramSet,
           };
           if (background) {
-            renderer.beginFrame(background(features, time));
+            renderer.beginFrame(background(features, time, frame));
             stack.draw(frame);
             renderer.endFrame();
           } else {

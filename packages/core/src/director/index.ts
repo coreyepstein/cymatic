@@ -14,7 +14,7 @@ export type {
   DirectorState,
   DirectorOptions,
 } from "./director.js";
-export { Director, DIRECTOR_PALETTE_ORDER } from "./director.js";
+export { Director, DIRECTOR_PALETTE_ORDER, restingDirectorState } from "./director.js";
 
 export { Section, SECTIONS, SectionTracker, classifySection } from "./sections.js";
 export type { SectionInput, SectionThresholds } from "./sections.js";

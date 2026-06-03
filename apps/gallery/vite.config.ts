@@ -16,6 +16,8 @@ export default defineConfig({
         "primitives-harness": fileURLToPath(new URL("./primitives-harness.html", import.meta.url)),
         // The V2-04 feedback / trail verification harness (e2e, not user-facing).
         "feedback-harness": fileURLToPath(new URL("./feedback-harness.html", import.meta.url)),
+        // The V2-10 cinematic geometric verification harness (e2e, not user-facing).
+        "geometric-harness": fileURLToPath(new URL("./geometric-harness.html", import.meta.url)),
       },
     },
   },
