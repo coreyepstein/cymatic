@@ -20,6 +20,8 @@ export default defineConfig({
         "geometric-harness": fileURLToPath(new URL("./geometric-harness.html", import.meta.url)),
         // The V2-11 cinematic color-field verification harness (e2e, not user-facing).
         "colorfield-harness": fileURLToPath(new URL("./colorfield-harness.html", import.meta.url)),
+        // The V2-12 cinematic generative verification harness (e2e, not user-facing).
+        "generative-harness": fileURLToPath(new URL("./generative-harness.html", import.meta.url)),
       },
     },
   },
